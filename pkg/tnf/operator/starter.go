@@ -22,6 +22,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/openshift/cluster-etcd-operator/pkg/etcdenvvar"
+	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/externaletcdsupportcontroller"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
@@ -52,6 +53,15 @@ func HandleDualReplicaClusters(
 
 	klog.Infof("detected DualReplica topology")
 
+	if controllerContext.KubeConfig != nil {
+		klog.Infof("waiting for bootstrap to complete")
+		err := bootstrapteardown.WaitForEtcdBootstrap(ctx, controllerContext.KubeConfig)
+		if err != nil {
+			klog.Errorf("failed to wait for bootstrap to complete: %v", err)
+			return false, err
+		}
+	}
+
 	runExternalEtcdSupportController(ctx, controllerContext, operatorClient, envVarGetter, kubeInformersForNamespaces, configInformers, networkInformer, controlPlaneNodeInformer, kubeClient)
 	runTnfResourceController(ctx, controllerContext, kubeClient, dynamicClient, operatorClient, kubeInformersForNamespaces)
 
@@ -69,6 +79,7 @@ func HandleDualReplicaClusters(
 	})
 	if err != nil {
 		klog.Errorf("failed to add eventhandler to control plane informer: %v", err)
+		return false, err
 	}
 
 	runTnfSetupJobController(ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
