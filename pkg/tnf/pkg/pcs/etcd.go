@@ -13,6 +13,7 @@ import (
 
 // ConfigureEtcd configures the etcd resource
 func ConfigureEtcd(ctx context.Context, cfg config.ClusterConfig) error {
+
 	klog.Info("Checking pcs resources")
 
 	stdOut, stdErr, err := exec.Execute(ctx, "/usr/sbin/pcs resource status")

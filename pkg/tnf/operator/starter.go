@@ -22,7 +22,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/openshift/cluster-etcd-operator/pkg/etcdenvvar"
-	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/externaletcdsupportcontroller"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
@@ -45,22 +44,13 @@ func HandleDualReplicaClusters(
 	kubeClient kubernetes.Interface,
 	dynamicClient dynamic.Interface) (bool, error) {
 
-	if isDualReplicaTopology, err := isDualReplicaTopoly(ctx, featureGateAccessor, configInformers); err != nil {
+	if isDualReplicaTopology, err := isDualReplicaTopology(ctx, featureGateAccessor, configInformers); err != nil {
 		return false, err
 	} else if !isDualReplicaTopology {
 		return false, nil
 	}
 
 	klog.Infof("detected DualReplica topology")
-
-	if controllerContext.KubeConfig != nil {
-		klog.Infof("waiting for bootstrap to complete")
-		err := bootstrapteardown.WaitForEtcdBootstrap(ctx, controllerContext.KubeConfig)
-		if err != nil {
-			klog.Errorf("failed to wait for bootstrap to complete: %v", err)
-			return false, err
-		}
-	}
 
 	runExternalEtcdSupportController(ctx, controllerContext, operatorClient, envVarGetter, kubeInformersForNamespaces, configInformers, networkInformer, controlPlaneNodeInformer, kubeClient)
 	runTnfResourceController(ctx, controllerContext, kubeClient, dynamicClient, operatorClient, kubeInformersForNamespaces)
@@ -87,7 +77,7 @@ func HandleDualReplicaClusters(
 	return true, nil
 }
 
-func isDualReplicaTopoly(ctx context.Context, featureGateAccessor featuregates.FeatureGateAccess, configInformers configv1informers.SharedInformerFactory) (bool, error) {
+func isDualReplicaTopology(ctx context.Context, featureGateAccessor featuregates.FeatureGateAccess, configInformers configv1informers.SharedInformerFactory) (bool, error) {
 	if isDualReplicaTopology, err := ceohelpers.IsDualReplicaTopology(ctx, configInformers.Config().V1().Infrastructures().Lister()); err != nil {
 		return false, fmt.Errorf("could not determine DualReplicaTopology, aborting controller start: %w", err)
 	} else if !isDualReplicaTopology {

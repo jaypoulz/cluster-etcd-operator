@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
+	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/config"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/etcd"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pcs"
@@ -20,7 +21,6 @@ import (
 )
 
 func RunTnfSetup() error {
-
 	klog.Info("Setting up clients etc. for TNF setup")
 
 	clientConfig, err := rest.InClusterConfig()
@@ -50,6 +50,13 @@ func RunTnfSetup() error {
 		<-shutdownHandler
 		klog.Info("Received SIGTERM or SIGINT signal, terminating")
 	}()
+
+	klog.Infof("Waiting for bootstrap to complete")
+	err = bootstrapteardown.WaitForEtcdBootstrap(ctx, clientConfig)
+	if err != nil {
+		klog.Errorf("failed to wait for bootstrap to complete: %v", err)
+		return err
+	}
 
 	klog.Info("Waiting for completed auth jobs")
 	authDone := func(context.Context) (done bool, err error) {
