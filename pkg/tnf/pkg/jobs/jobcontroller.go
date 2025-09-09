@@ -26,6 +26,8 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
 )
 
+var DefaultConditions = []string{opv1.OperatorStatusTypeProgressing, opv1.OperatorStatusTypeDegraded}
+
 // TODO This based on DeploymentController in openshift/library-go
 // TODO should be moved there once it proved to be useful
 
@@ -71,6 +73,7 @@ func NewJobController(
 	operatorClient v1helpers.OperatorClient,
 	kubeClient kubernetes.Interface,
 	jobInformer batchinformersv1.JobInformer,
+	conditions []string,
 	optionalInformers []factory.Informer,
 	optionalJobHooks ...JobHookFunc,
 ) factory.Controller {
@@ -82,14 +85,20 @@ func NewJobController(
 		kubeClient,
 		jobInformer,
 	).WithConditions(
-		opv1.OperatorStatusTypeAvailable,
-		opv1.OperatorStatusTypeProgressing,
-		opv1.OperatorStatusTypeDegraded,
+		// By default, we only set the progressing and degraded conditions for TNF setup.
+		// This is because the operator is only unavailable during the transition of etcd
+		// ownership between CEO and pacemaker.
+		DefaultConditions...,
 	).WithExtraInformers(
 		optionalInformers...,
 	).WithJobHooks(
 		optionalJobHooks...,
 	)
+
+	// If the optionalConditionOverrides is set, we override the default conditions
+	if len(conditions) > 0 {
+		c.conditions = conditions
+	}
 
 	controller, err := c.ToController()
 	if err != nil {

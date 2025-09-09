@@ -52,12 +52,18 @@ func HandleDualReplicaClusters(
 
 	klog.Infof("detected DualReplica topology")
 
+	// We only set the CEO available status to false during the initial setup
+	initialSetup, err := isInitialSetup(operatorClient)
+	if err != nil {
+		return false, fmt.Errorf("could not determine if we are in the initial setup: %w", err)
+	}
+
 	runExternalEtcdSupportController(ctx, controllerContext, operatorClient, envVarGetter, kubeInformersForNamespaces, configInformers, networkInformer, controlPlaneNodeInformer, kubeClient)
 	runTnfResourceController(ctx, controllerContext, kubeClient, dynamicClient, operatorClient, kubeInformersForNamespaces)
 
 	// we need node names for assigning auth jobs to specific nodes
 	klog.Infof("watching for nodes...")
-	_, err := controlPlaneNodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = controlPlaneNodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			node, ok := obj.(*corev1.Node)
 			if !ok {
@@ -72,9 +78,22 @@ func HandleDualReplicaClusters(
 		return false, err
 	}
 
-	runTnfSetupJobController(ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
-
+	runTnfSetupJobController(ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, initialSetup)
 	return true, nil
+}
+
+func isInitialSetup(operatorClient v1helpers.StaticPodOperatorClient) (bool, error) {
+	// Detect if the cluster is already running in ExternalEtcd mode
+	operatorSpec, _, _, err := operatorClient.GetStaticPodOperatorState()
+	if err != nil {
+		return false, fmt.Errorf("could not get operator spec: %w", err)
+	}
+	externalEtcdMode, err := ceohelpers.IsExternalEtcdSupport(operatorSpec)
+	if err != nil {
+		return false, fmt.Errorf("could not determine if useExternalEtcdSupport config override is set: %w", err)
+	}
+
+	return !externalEtcdMode, nil
 }
 
 func isDualReplicaTopology(ctx context.Context, featureGateAccessor featuregates.FeatureGateAccess, configInformers configv1informers.SharedInformerFactory) (bool, error) {
@@ -142,6 +161,7 @@ func runTnfAuthJobController(ctx context.Context, nodeName string, controllerCon
 		operatorClient,
 		kubeClient,
 		kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Batch().V1().Jobs(),
+		jobs.DefaultConditions, // Add the conditions parameter
 		[]factory.Informer{},
 		[]jobs.JobHookFunc{
 			func(_ *operatorv1.OperatorSpec, job *batchv1.Job) error {
@@ -158,8 +178,16 @@ func runTnfAuthJobController(ctx context.Context, nodeName string, controllerCon
 	go tnfJobController.Run(ctx, 1)
 }
 
-func runTnfSetupJobController(ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) {
+func runTnfSetupJobController(ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, setOpAvailableStatus bool) {
 	klog.Infof("starting Two Node Fencing setup job controller")
+
+	// If we are in the initial setup, we set the operator available status to false when the setup job is running
+	// and restore it to true only if the setup job completes successfully.
+	conditions := jobs.DefaultConditions
+	if setOpAvailableStatus {
+		conditions = append(conditions, operatorv1.OperatorStatusTypeAvailable)
+	}
+
 	tnfJobController := jobs.NewJobController(
 		"TnfSetupJob",
 		tnf_assets.MustAsset("tnfdeployment/setupjob.yaml"),
@@ -167,6 +195,7 @@ func runTnfSetupJobController(ctx context.Context, controllerContext *controller
 		operatorClient,
 		kubeClient,
 		kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Batch().V1().Jobs(),
+		conditions,
 		// TODO add secret informer here for rerunning setup with modified fencing credentials
 		[]factory.Informer{},
 		[]jobs.JobHookFunc{
@@ -188,6 +217,7 @@ func runTnfAfterSetupJobController(ctx context.Context, nodeName string, control
 		operatorClient,
 		kubeClient,
 		kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Batch().V1().Jobs(),
+		jobs.DefaultConditions, // Add the conditions parameter
 		[]factory.Informer{},
 		[]jobs.JobHookFunc{
 			func(_ *operatorv1.OperatorSpec, job *batchv1.Job) error {
