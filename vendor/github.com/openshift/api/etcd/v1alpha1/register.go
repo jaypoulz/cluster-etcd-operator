@@ -31,10 +31,9 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	metav1.AddToGroupVersion(scheme, GroupVersion)
 
 	scheme.AddKnownTypes(GroupVersion,
-		&PacemakerStatus{},
-		&PacemakerStatusList{},
+		&PacemakerCluster{},
+		&PacemakerClusterList{},
 	)
 
 	return nil
 }
-

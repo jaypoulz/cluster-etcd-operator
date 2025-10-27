@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -12,7 +13,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
-	v1alpha1 "github.com/openshift/api/etcd/v1alpha1"
+	"github.com/openshift/api/etcd/v1alpha1"
+
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/exec"
 )
 
@@ -49,7 +51,7 @@ const (
 
 	// Kubernetes API constants (kubernetesAPIPath and pacemakerResourceName shared with healthcheck.go)
 	statusSubresource = "status"
-	pacemakerKind     = "PacemakerStatus"
+	pacemakerKind     = "PacemakerCluster"
 
 	// Environment variables
 	envKubeconfig         = "KUBECONFIG"
@@ -198,7 +200,7 @@ type FenceEvent struct {
 func NewPacemakerStatusCollectorCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pacemaker-status-collector",
-		Short: "Collects pacemaker status and updates PacemakerStatus CR",
+		Short: "Collects pacemaker status and updates PacemakerCluster CR",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := runCollector(); err != nil {
 				klog.Errorf("Failed to collect pacemaker status: %v", err)
@@ -212,7 +214,7 @@ func NewPacemakerStatusCollectorCommand() *cobra.Command {
 // runCollector executes the full pacemaker status collection workflow:
 // 1. Executes "sudo -n pcs status xml" to get cluster status
 // 2. Parses the XML output into structured data
-// 3. Updates or creates the PacemakerStatus CR with the collected information
+// 3. Updates or creates the PacemakerCluster CR with the collected information
 func runCollector() error {
 	ctx, cancel := context.WithTimeout(context.Background(), collectorTimeout)
 	defer cancel()
@@ -222,12 +224,12 @@ func runCollector() error {
 	// Collect pacemaker status
 	rawXML, summary, nodes, resources, nodeHistory, fencingHistory, collectionError := collectPacemakerStatus(ctx)
 
-	// Update PacemakerStatus CR
+	// Update PacemakerCluster CR
 	if err := updatePacemakerStatusCR(ctx, rawXML, summary, nodes, resources, nodeHistory, fencingHistory, collectionError); err != nil {
-		return fmt.Errorf("failed to update PacemakerStatus CR: %w", err)
+		return fmt.Errorf("failed to update PacemakerCluster CR: %w", err)
 	}
 
-	klog.Info("Successfully updated PacemakerStatus CR")
+	klog.Info("Successfully updated PacemakerCluster CR")
 	return nil
 }
 
@@ -238,10 +240,10 @@ func runCollector() error {
 func collectPacemakerStatus(ctx context.Context) (
 	rawXML string,
 	summary *v1alpha1.PacemakerSummary,
-	nodes []v1alpha1.NodeStatus,
-	resources []v1alpha1.ResourceStatus,
-	nodeHistory []v1alpha1.NodeHistoryEntry,
-	fencingHistory []v1alpha1.FencingEvent,
+	nodes []v1alpha1.PacemakerNodeStatus,
+	resources []v1alpha1.PacemakerResourceStatus,
+	nodeHistory []v1alpha1.PacemakerNodeHistoryEntry,
+	fencingHistory []v1alpha1.PacemakerFencingEvent,
 	collectionError string,
 ) {
 	// Execute the pcs status xml command with a timeout
@@ -288,10 +290,10 @@ func collectPacemakerStatus(ctx context.Context) (
 // Historical data is filtered to recent time windows (5 minutes for operations, 24 hours for fencing).
 func buildStatusComponents(result *PacemakerResult) (
 	summary *v1alpha1.PacemakerSummary,
-	nodes []v1alpha1.NodeStatus,
-	resources []v1alpha1.ResourceStatus,
-	nodeHistory []v1alpha1.NodeHistoryEntry,
-	fencingHistory []v1alpha1.FencingEvent,
+	nodes []v1alpha1.PacemakerNodeStatus,
+	resources []v1alpha1.PacemakerResourceStatus,
+	nodeHistory []v1alpha1.PacemakerNodeHistoryEntry,
+	fencingHistory []v1alpha1.PacemakerFencingEvent,
 ) {
 	// Build high-level summary
 	// Convert quorum boolean to typed constant
@@ -300,9 +302,19 @@ func buildStatusComponents(result *PacemakerResult) (
 		quorumStatus = v1alpha1.QuorumStatusQuorate
 	}
 
+	var pdst v1alpha1.PacemakerDaemonStateType
+	switch result.Summary.Stack.PacemakerdState {
+	case "running", "Running":
+		pdst = v1alpha1.PacemakerDaemonStateRunning
+	default:
+		// Any state other than "running" is treated as not running
+		// This includes: init, wait_for_ping, starting_daemons, shutting_down, shutdown_complete, stopped, etc.
+		pdst = v1alpha1.PacemakerDaemonStateNotRunning
+	}
+
 	summary = &v1alpha1.PacemakerSummary{
-		PacemakerdState: result.Summary.Stack.PacemakerdState,
-		QuorumStatus:    quorumStatus,
+		PacemakerDaemonState: pdst,
+		QuorumStatus:         quorumStatus,
 	}
 
 	// Build node IP map from node attributes
@@ -339,12 +351,27 @@ func buildStatusComponents(result *PacemakerResult) (
 			mode = v1alpha1.NodeModeStandby
 		}
 
-		nodes = append(nodes, v1alpha1.NodeStatus{
+		// Parse IP address to determine if it's IPv4 or IPv6
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			klog.Warningf("Failed to parse IP address %s for node %s", ip, node.Name)
+			continue
+		}
+
+		nodeStatus := v1alpha1.PacemakerNodeStatus{
 			Name:         node.Name,
-			IP:           ip,
 			OnlineStatus: onlineStatus,
 			Mode:         mode,
-		})
+		}
+
+		// Set the appropriate IP field based on IP version
+		if parsedIP.To4() != nil {
+			nodeStatus.IPv4Address = ip
+		} else {
+			nodeStatus.IPv6Address = ip
+		}
+
+		nodes = append(nodes, nodeStatus)
 	}
 	totalNodes := int32(len(result.Nodes.Node))
 	summary.NodesOnline = &onlineCount
@@ -366,10 +393,10 @@ func buildStatusComponents(result *PacemakerResult) (
 			resourcesStarted++
 		}
 
-		resources = append(resources, v1alpha1.ResourceStatus{
+		resources = append(resources, v1alpha1.PacemakerResourceStatus{
 			Name:          resource.ID,
 			ResourceAgent: resource.ResourceAgent,
-			Role:          resource.Role,
+			Role:          v1alpha1.ResourceRoleType(resource.Role),
 			ActiveStatus:  activeStatus,
 			Node:          resource.Node.Name,
 		})
@@ -417,7 +444,7 @@ func buildStatusComponents(result *PacemakerResult) (
 					}
 				}
 
-				nodeHistory = append(nodeHistory, v1alpha1.NodeHistoryEntry{
+				nodeHistory = append(nodeHistory, v1alpha1.PacemakerNodeHistoryEntry{
 					Node:         node.Name,
 					Resource:     resourceHistory.ID,
 					Operation:    operation.Task,
@@ -445,10 +472,10 @@ func buildStatusComponents(result *PacemakerResult) (
 			continue
 		}
 
-		fencingHistory = append(fencingHistory, v1alpha1.FencingEvent{
+		fencingHistory = append(fencingHistory, v1alpha1.PacemakerFencingEvent{
 			Target:    fenceEvent.Target,
-			Action:    fenceEvent.Action,
-			Status:    fenceEvent.Status,
+			Action:    v1alpha1.FencingActionType(fenceEvent.Action),
+			Status:    v1alpha1.FencingStatusType(fenceEvent.Status),
 			Completed: metav1.NewTime(t),
 		})
 	}
@@ -456,7 +483,7 @@ func buildStatusComponents(result *PacemakerResult) (
 	return summary, nodes, resources, nodeHistory, fencingHistory
 }
 
-// updatePacemakerStatusCR updates or creates the PacemakerStatus custom resource
+// updatePacemakerStatusCR updates or creates the PacemakerCluster custom resource
 // with the collected status information. The CR is named "cluster" and is cluster-scoped.
 // If the CR doesn't exist, it will be created; otherwise, its status subresource is updated.
 //
@@ -466,10 +493,10 @@ func updatePacemakerStatusCR(
 	ctx context.Context,
 	rawXML string,
 	summary *v1alpha1.PacemakerSummary,
-	nodes []v1alpha1.NodeStatus,
-	resources []v1alpha1.ResourceStatus,
-	nodeHistory []v1alpha1.NodeHistoryEntry,
-	fencingHistory []v1alpha1.FencingEvent,
+	nodes []v1alpha1.PacemakerNodeStatus,
+	resources []v1alpha1.PacemakerResourceStatus,
+	nodeHistory []v1alpha1.PacemakerNodeHistoryEntry,
+	fencingHistory []v1alpha1.PacemakerFencingEvent,
 	collectionError string,
 ) error {
 	// Create REST client for the PacemakerStatus CRD
@@ -483,8 +510,8 @@ func updatePacemakerStatusCR(
 		return err
 	}
 
-	// Try to get existing PacemakerStatus
-	var existing v1alpha1.PacemakerStatus
+	// Try to get existing PacemakerCluster
+	var existing v1alpha1.PacemakerCluster
 	err = restClient.Get().
 		Resource(pacemakerResourceName).
 		Name(PacemakerStatusResourceName).
@@ -494,9 +521,9 @@ func updatePacemakerStatusCR(
 	now := metav1.Now()
 
 	if err != nil {
-		// Create new PacemakerStatus if it doesn't exist
+		// Create new PacemakerCluster if it doesn't exist
 		if apierrors.IsNotFound(err) {
-			newStatus := &v1alpha1.PacemakerStatus{
+			newStatus := &v1alpha1.PacemakerCluster{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1alpha1.SchemeGroupVersion.String(),
 					Kind:       pacemakerKind,
@@ -504,7 +531,7 @@ func updatePacemakerStatusCR(
 				ObjectMeta: metav1.ObjectMeta{
 					Name: PacemakerStatusResourceName,
 				},
-				Status: &v1alpha1.PacemakerStatusStatus{
+				Status: v1alpha1.PacemakerClusterStatus{
 					LastUpdated:     now,
 					RawXML:          rawXML,
 					CollectionError: collectionError,
@@ -522,7 +549,7 @@ func updatePacemakerStatusCR(
 				Do(ctx)
 
 			if result.Error() != nil {
-				return fmt.Errorf("failed to create PacemakerStatus: %w", result.Error())
+				return fmt.Errorf("failed to create PacemakerCluster: %w", result.Error())
 			}
 
 			// Ensure status is set on initial create when CRD uses the status subresource
@@ -533,21 +560,16 @@ func updatePacemakerStatusCR(
 				Body(newStatus).
 				Do(ctx)
 			if result.Error() != nil {
-				return fmt.Errorf("failed to initialize PacemakerStatus status: %w", result.Error())
+				return fmt.Errorf("failed to initialize PacemakerCluster status: %w", result.Error())
 			}
-			klog.Info("Created and initialized PacemakerStatus CR")
+			klog.Info("Created and initialized PacemakerCluster CR")
 
 			return nil
 		}
-		return fmt.Errorf("failed to get PacemakerStatus: %w", err)
+		return fmt.Errorf("failed to get PacemakerCluster: %w", err)
 	}
 
-	// Initialize Status field if it's nil to avoid nil pointer dereference
-	if existing.Status == nil {
-		existing.Status = &v1alpha1.PacemakerStatusStatus{}
-	}
-
-	// Update existing PacemakerStatus
+	// Update existing PacemakerCluster
 	existing.Status.LastUpdated = now
 	existing.Status.RawXML = rawXML
 	existing.Status.CollectionError = collectionError
@@ -565,9 +587,9 @@ func updatePacemakerStatusCR(
 		Do(ctx)
 
 	if result.Error() != nil {
-		return fmt.Errorf("failed to update PacemakerStatus: %w", result.Error())
+		return fmt.Errorf("failed to update PacemakerCluster: %w", result.Error())
 	}
 
-	klog.Info("Updated existing PacemakerStatus CR")
+	klog.Info("Updated existing PacemakerCluster CR")
 	return nil
 }

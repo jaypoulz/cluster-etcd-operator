@@ -264,7 +264,7 @@ github.com/openshift-eng/openshift-tests-extension/pkg/ginkgo
 github.com/openshift-eng/openshift-tests-extension/pkg/junit
 github.com/openshift-eng/openshift-tests-extension/pkg/util/sets
 github.com/openshift-eng/openshift-tests-extension/pkg/version
-# github.com/openshift/api v0.0.1 => /home/jpoulin/Projects/jaypoulz/api
+# github.com/openshift/api v0.0.1 => github.com/jaypoulz/api v0.0.0-20251024223647-cbe66c922333
 ## explicit; go 1.24.0
 github.com/openshift/api
 github.com/openshift/api/annotations
@@ -1772,4 +1772,4 @@ sigs.k8s.io/yaml
 # github.com/gogo/protobuf => github.com/gogo/protobuf v1.3.2
 # github.com/onsi/ginkgo/v2 => github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20241205171354-8006f302fd12
 # vbom.ml/util => github.com/fvbommel/util v0.0.0-20180919145318-efcd4e0f9787
-# github.com/openshift/api => /home/jpoulin/Projects/jaypoulz/api
+# github.com/openshift/api => github.com/jaypoulz/api v0.0.0-20251024223647-cbe66c922333

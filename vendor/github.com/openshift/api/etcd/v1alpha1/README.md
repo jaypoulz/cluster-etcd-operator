@@ -2,9 +2,9 @@
 
 This API group contains types related to two-node fencing for etcd cluster management.
 
-## PacemakerStatus
+## PacemakerCluster
 
-The `PacemakerStatus` CRD provides visibility into the health and status of Pacemaker-managed clusters in dual-replica (two-node) OpenShift deployments.
+The `PacemakerCluster` CRD provides visibility into the health and status of Pacemaker-managed clusters in dual-replica (two-node) OpenShift deployments.
 
 ### Feature Gate
 
@@ -13,16 +13,30 @@ The `PacemakerStatus` CRD provides visibility into the health and status of Pace
 
 ### Usage
 
-The PacemakerStatus resource is a cluster-scoped, status-only singleton named "cluster". It is periodically updated by a privileged controller that runs `pcs status xml` and parses the output into structured fields for health checking.
+The PacemakerCluster resource is a cluster-scoped, status-only singleton named "cluster". It is periodically updated by a privileged controller that runs `pcs status xml` and parses the output into structured fields for health checking.
 
-### Fields
+### Status Fields
 
-- **Summary**: High-level cluster state (quorum, node counts, resource counts, recent failures/fencing)
-- **Nodes**: Detailed per-node status (online, standby)
-- **Resources**: Detailed per-resource status (agent type, role, active state, node)
-- **NodeHistory**: Recent operation history for troubleshooting
-- **FencingHistory**: Recent fencing events
-- **RawXML**: Complete XML output (for debugging only, max 256KB)
+- **LastUpdated** (required): Timestamp when status was last collected
+- **Summary**: High-level cluster state including:
+  - `pacemakerDaemonState`: Running state of the pacemaker daemon (enum: `Running`, `KnownNotRunning`)
+  - `quorumStatus`: Whether cluster has quorum (enum: `Quorate`, `NoQuorum`)
+  - `nodesOnline`, `nodesTotal`: Node counts
+  - `resourcesStarted`, `resourcesTotal`: Resource counts
+- **Nodes**: Detailed per-node status (name, IPv4/IPv6 addresses, online status, mode)
+- **Resources**: Detailed per-resource status (name, resource agent type, role enum, active status, node assignment)
+- **NodeHistory**: Recent operation history for troubleshooting (operation failures within last 5 minutes)
+- **FencingHistory**: Recent fencing events (events within last 24 hours)
+- **RawXML**: Complete XML output from `pcs status xml` (for debugging only, max 256KB)
+- **CollectionError**: Any errors encountered during status collection
+
+### Design Principles
+
+The API follows a "Design Principle: Act on Deterministic Information" approach:
+- Almost all fields are optional except `lastUpdated`
+- Missing data means "unknown" not "error"
+- The operator only transitions between PacemakerHealthy and PacemakerDegraded states based on deterministic information
+- When information is unavailable, the last known state is preserved
 
 ### Notes
 

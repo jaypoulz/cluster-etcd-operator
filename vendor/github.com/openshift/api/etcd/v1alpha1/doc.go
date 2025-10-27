@@ -6,4 +6,3 @@
 // +kubebuilder:validation:Optional
 // +groupName=etcd.openshift.io
 package v1alpha1
-

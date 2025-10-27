@@ -19,7 +19,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	v1alpha1 "github.com/openshift/api/etcd/v1alpha1"
+	"github.com/openshift/api/etcd/v1alpha1"
+
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/health"
 )
 
@@ -78,7 +79,7 @@ const (
 
 	// Kubernetes API constants
 	kubernetesAPIPath     = "/apis"
-	pacemakerResourceName = "pacemakerstatuses"
+	pacemakerResourceName = "pacemakerclusters"
 
 	// Time thresholds
 	statusStalenessThreshold       = 2 * time.Minute
@@ -139,7 +140,7 @@ type HealthCheck struct {
 
 	// Track last processed PacemakerStatus to detect changes
 	lastProcessedStatusMu sync.Mutex
-	lastProcessedStatus   *v1alpha1.PacemakerStatus
+	lastProcessedStatus   *v1alpha1.PacemakerCluster
 
 	// Track last time we successfully retrieved a valid (non-Unknown) status
 	lastValidStatusTimeMu sync.Mutex
@@ -172,7 +173,7 @@ func NewHealthCheck(
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				result := &v1alpha1.PacemakerStatusList{}
+				result := &v1alpha1.PacemakerClusterList{}
 				err := restClient.Get().
 					Resource(pacemakerResourceName).
 					VersionedParams(&options, runtime.NewParameterCodec(scheme)).
@@ -187,7 +188,7 @@ func NewHealthCheck(
 					Watch(context.Background())
 			},
 		},
-		&v1alpha1.PacemakerStatus{},
+		&v1alpha1.PacemakerCluster{},
 		healthCheckResyncInterval,
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 	)
@@ -268,7 +269,7 @@ func (c *HealthCheck) getPacemakerStatus(ctx context.Context) (*HealthStatus, er
 	klog.V(4).Infof("Retrieving pacemaker status from CR...")
 
 	// Get the PacemakerStatus CR
-	pacemakerStatus := &v1alpha1.PacemakerStatus{}
+	pacemakerStatus := &v1alpha1.PacemakerCluster{}
 	err := c.pacemakerRESTClient.Get().
 		Resource(pacemakerResourceName).
 		Name(PacemakerStatusResourceName).
@@ -279,10 +280,10 @@ func (c *HealthCheck) getPacemakerStatus(ctx context.Context) (*HealthStatus, er
 		return newUnknownHealthStatus(fmt.Sprintf("Failed to get PacemakerStatus CR: %v", err)), nil
 	}
 
-	// Check if status is populated
-	if pacemakerStatus.Status == nil {
-		return newUnknownHealthStatus("PacemakerStatus CR has no status populated"), nil
-	}
+	//// Check if status is populated
+	//if pacemakerStatus.Status == nil {
+	//	return newUnknownHealthStatus("PacemakerStatus CR has no status populated"), nil
+	//}
 
 	// Check if there was an error collecting the status
 	if pacemakerStatus.Status.CollectionError != "" {
@@ -307,19 +308,19 @@ func (c *HealthCheck) getPacemakerStatus(ctx context.Context) (*HealthStatus, er
 
 // buildHealthStatusFromCR builds a HealthStatus from the PacemakerStatus CR status fields
 // Note: This function assumes Status is not nil (checked by caller in getPacemakerStatus)
-func (c *HealthCheck) buildHealthStatusFromCR(pacemakerStatus *v1alpha1.PacemakerStatus) *HealthStatus {
+func (c *HealthCheck) buildHealthStatusFromCR(pacemakerStatus *v1alpha1.PacemakerCluster) *HealthStatus {
 	status := &HealthStatus{
 		OverallStatus: statusUnknown,
 		Warnings:      []string{},
 		Errors:        []string{},
 	}
 
-	// Defensive check: this should not happen as getPacemakerStatus checks for nil Status
-	if pacemakerStatus.Status == nil {
-		klog.Errorf("buildHealthStatusFromCR called with nil Status")
-		status.Errors = append(status.Errors, "Internal error: nil Status in buildHealthStatusFromCR")
-		return status
-	}
+	//// Defensive check: this should not happen as getPacemakerStatus checks for nil Status
+	//if pacemakerStatus.Status == nil {
+	//	klog.Errorf("buildHealthStatusFromCR called with nil Status")
+	//	status.Errors = append(status.Errors, "Internal error: nil Status in buildHealthStatusFromCR")
+	//	return status
+	//}
 
 	// Check if Summary exists and has required data
 	if pacemakerStatus.Status.Summary == nil {
@@ -327,13 +328,13 @@ func (c *HealthCheck) buildHealthStatusFromCR(pacemakerStatus *v1alpha1.Pacemake
 		return status
 	}
 
-	if pacemakerStatus.Status.Summary.PacemakerdState == "" {
+	if pacemakerStatus.Status.Summary.PacemakerDaemonState == "" {
 		klog.V(2).Infof("PacemakerStatus.Status.Summary.PacemakerdState is empty, status unknown")
 		return status
 	}
 
 	// Check if pacemaker is running
-	if pacemakerStatus.Status.Summary.PacemakerdState != pacemakerStateRunning {
+	if pacemakerStatus.Status.Summary.PacemakerDaemonState != pacemakerStateRunning {
 		status.Errors = append(status.Errors, msgPacemakerNotRunning)
 		status.OverallStatus = statusError
 		return status
@@ -364,7 +365,7 @@ func (c *HealthCheck) buildHealthStatusFromCR(pacemakerStatus *v1alpha1.Pacemake
 }
 
 // checkNodeStatus checks if all nodes are online using CRD status fields
-func (c *HealthCheck) checkNodeStatus(pacemakerStatus *v1alpha1.PacemakerStatus, status *HealthStatus) {
+func (c *HealthCheck) checkNodeStatus(pacemakerStatus *v1alpha1.PacemakerCluster, status *HealthStatus) {
 	// Nil-guard for Nodes field - missing data means status is unknown
 	if pacemakerStatus.Status.Nodes == nil {
 		klog.V(2).Infof("PacemakerStatus.Status.Nodes is nil, cannot determine node status")
@@ -399,7 +400,7 @@ func (c *HealthCheck) checkNodeStatus(pacemakerStatus *v1alpha1.PacemakerStatus,
 }
 
 // checkResourceStatus checks if kubelet and etcd resources are started on both nodes using CRD status fields
-func (c *HealthCheck) checkResourceStatus(pacemakerStatus *v1alpha1.PacemakerStatus, status *HealthStatus) {
+func (c *HealthCheck) checkResourceStatus(pacemakerStatus *v1alpha1.PacemakerCluster, status *HealthStatus) {
 	// Nil-guard for Resources field - missing data means we can't check resources
 	if pacemakerStatus.Status.Resources == nil {
 		klog.V(2).Infof("PacemakerStatus.Status.Resources is nil, cannot determine resource status")
@@ -448,7 +449,7 @@ func (c *HealthCheck) validateResourceCount(resourceName string, actualCount int
 }
 
 // checkRecentFailures checks for recent failed resource actions using CRD status fields
-func (c *HealthCheck) checkRecentFailures(pacemakerStatus *v1alpha1.PacemakerStatus, status *HealthStatus) {
+func (c *HealthCheck) checkRecentFailures(pacemakerStatus *v1alpha1.PacemakerCluster, status *HealthStatus) {
 	// Nil-guard for NodeHistory field
 	if pacemakerStatus.Status.NodeHistory == nil {
 		klog.V(4).Infof("PacemakerStatus.Status.NodeHistory is nil, no recent failures to check")
@@ -468,7 +469,7 @@ func (c *HealthCheck) checkRecentFailures(pacemakerStatus *v1alpha1.PacemakerSta
 }
 
 // checkFencingEvents checks for recent fencing events using CRD status fields
-func (c *HealthCheck) checkFencingEvents(pacemakerStatus *v1alpha1.PacemakerStatus, status *HealthStatus) {
+func (c *HealthCheck) checkFencingEvents(pacemakerStatus *v1alpha1.PacemakerCluster, status *HealthStatus) {
 	// Nil-guard for FencingHistory field
 	if pacemakerStatus.Status.FencingHistory == nil {
 		klog.V(4).Infof("PacemakerStatus.Status.FencingHistory is nil, no fencing events to check")

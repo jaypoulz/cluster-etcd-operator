@@ -19,13 +19,10 @@ import (
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextclientv1 "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -310,6 +307,7 @@ func runTnfResourceController(ctx context.Context, controllerContext *controller
 			"tnfdeployment/role-binding.yaml",
 			"tnfdeployment/clusterrole.yaml",
 			"tnfdeployment/clusterrole-binding.yaml",
+			"tnfdeployment/tmp_pacemakerclusters.crd.yaml",
 		},
 		(&resourceapply.ClientHolder{}).WithKubernetes(kubeClient).WithDynamicClient(dynamicClient),
 		operatorClient,
@@ -359,30 +357,7 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 			break
 		}
 
-		klog.Infof("etcd has transitioned to external; applying PacemakerStatus CRD")
-
-		// Apply the PacemakerStatus CRD before starting the collector
-		// The collector CronJob will need this CRD to create PacemakerStatus resources
-		// Retry until successful or context is cancelled
-		for {
-			if err := applyPacemakerStatusCRD(ctx, controllerContext); err != nil {
-				if ctx.Err() != nil {
-					klog.Infof("context done while applying PacemakerStatus CRD: %v", err)
-					return
-				}
-				klog.Errorf("failed to apply PacemakerStatus CRD, will retry in 30s: %v", err)
-				select {
-				case <-time.After(30 * time.Second):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-			// CRD applied successfully, break out of the retry loop
-			klog.Infof("PacemakerStatus CRD applied successfully, starting status collector CronJob")
-			break
-		}
-
+		klog.Infof("etcd has transitioned to external; run pacemaker status collector cronjob")
 		runPacemakerStatusCollectorCronJob(ctx, controllerContext, operatorClient, kubeClient)
 	}()
 }
@@ -563,50 +538,4 @@ func handleFencingSecretChange(ctx context.Context, client kubernetes.Interface,
 		// TODO how to trigger a retry here...
 		klog.Errorf("failed to delete fencing job: %v", err)
 	}
-}
-
-// applyPacemakerStatusCRD applies the PacemakerStatus CRD to the cluster.
-// This must be called after external etcd transition is complete and before
-// starting the status collector CronJob, as the CronJob will need to create
-// PacemakerStatus custom resources.
-func applyPacemakerStatusCRD(ctx context.Context, controllerContext *controllercmd.ControllerContext) error {
-	klog.Infof("applying PacemakerStatus CRD")
-
-	// Read the CRD manifest from bindata
-	crdBytes, err := bindata.Asset("etcd/pacemakerstatus-crd.yaml")
-	if err != nil {
-		return fmt.Errorf("failed to read PacemakerStatus CRD from bindata: %w", err)
-	}
-
-	// Decode the CRD
-	crd := &apiextensionsv1.CustomResourceDefinition{}
-	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(crdBytes), 4096)
-	if err := decoder.Decode(crd); err != nil {
-		return fmt.Errorf("failed to decode PacemakerStatus CRD: %w", err)
-	}
-
-	// Get the apiextensions client
-	apiextClient, err := apiextclientv1.NewForConfig(controllerContext.KubeConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create apiextensions client: %w", err)
-	}
-
-	// Apply the CRD
-	_, updated, err := resourceapply.ApplyCustomResourceDefinitionV1(
-		ctx,
-		apiextClient,
-		controllerContext.EventRecorder,
-		crd,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to apply PacemakerStatus CRD: %w", err)
-	}
-
-	if updated {
-		klog.Infof("PacemakerStatus CRD created or updated successfully")
-	} else {
-		klog.V(2).Infof("PacemakerStatus CRD already exists and is up to date")
-	}
-
-	return nil
 }

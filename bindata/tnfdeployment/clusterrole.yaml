@@ -32,7 +32,7 @@ rules:
   - apiGroups:
       - etcd.openshift.io
     resources:
-      - pacemakerstatuses
+      - pacemakerclusters
     verbs:
       - get
       - list
@@ -43,7 +43,7 @@ rules:
   - apiGroups:
       - etcd.openshift.io
     resources:
-      - pacemakerstatuses/status
+      - pacemakerclusters/status
     verbs:
       - get
       - update

@@ -57,8 +57,8 @@ func createTestHealthCheck() *HealthCheck {
 	}
 }
 
-// createTestHealthCheckWithMockStatus creates a HealthCheck with a mocked PacemakerStatus CR
-func createTestHealthCheckWithMockStatus(t *testing.T, mockStatus *v1alpha1.PacemakerStatus) *HealthCheck {
+// createTestHealthCheckWithMockStatus creates a HealthCheck with a mocked PacemakerCluster CR
+func createTestHealthCheckWithMockStatus(t *testing.T, mockStatus *v1alpha1.PacemakerCluster) *HealthCheck {
 	kubeClient := fake.NewSimpleClientset()
 	operatorClient := v1helpers.NewFakeStaticPodOperatorClient(
 		&operatorv1.StaticPodOperatorSpec{
@@ -156,31 +156,31 @@ func TestNewHealthCheck(t *testing.T) {
 func TestHealthCheck_getPacemakerStatus(t *testing.T) {
 	tests := []struct {
 		name           string
-		mockStatus     *v1alpha1.PacemakerStatus
+		mockStatus     *v1alpha1.PacemakerCluster
 		expectedStatus string
 		expectErrors   bool
 		expectWarnings bool
 	}{
 		{
 			name: "healthy_status",
-			mockStatus: &v1alpha1.PacemakerStatus{
+			mockStatus: &v1alpha1.PacemakerCluster{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1alpha1.SchemeGroupVersion.String(),
-					Kind:       "PacemakerStatus",
+					Kind:       "PacemakerCluster",
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
 				},
-				Status: &v1alpha1.PacemakerStatusStatus{
+				Status: v1alpha1.PacemakerClusterStatus{
 					Summary: &v1alpha1.PacemakerSummary{
-						PacemakerdState: "running",
-						QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+						PacemakerDaemonState: "running",
+						QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 					},
-					Nodes: []v1alpha1.NodeStatus{
+					Nodes: []v1alpha1.PacemakerNodeStatus{
 						{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 						{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 					},
-					Resources: []v1alpha1.ResourceStatus{
+					Resources: []v1alpha1.PacemakerResourceStatus{
 						{Name: "kubelet-clone-0", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 						{Name: "kubelet-clone-1", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 						{Name: "etcd-clone-0", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
@@ -196,15 +196,15 @@ func TestHealthCheck_getPacemakerStatus(t *testing.T) {
 		},
 		{
 			name: "collection_error",
-			mockStatus: &v1alpha1.PacemakerStatus{
+			mockStatus: &v1alpha1.PacemakerCluster{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1alpha1.SchemeGroupVersion.String(),
-					Kind:       "PacemakerStatus",
+					Kind:       "PacemakerCluster",
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
 				},
-				Status: &v1alpha1.PacemakerStatusStatus{
+				Status: v1alpha1.PacemakerClusterStatus{
 					CollectionError: "Failed to execute pcs command",
 					LastUpdated:     metav1.Now(),
 				},
@@ -215,18 +215,18 @@ func TestHealthCheck_getPacemakerStatus(t *testing.T) {
 		},
 		{
 			name: "stale_status",
-			mockStatus: &v1alpha1.PacemakerStatus{
+			mockStatus: &v1alpha1.PacemakerCluster{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1alpha1.SchemeGroupVersion.String(),
-					Kind:       "PacemakerStatus",
+					Kind:       "PacemakerCluster",
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
 				},
-				Status: &v1alpha1.PacemakerStatusStatus{
+				Status: v1alpha1.PacemakerClusterStatus{
 					Summary: &v1alpha1.PacemakerSummary{
-						PacemakerdState: "running",
-						QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+						PacemakerDaemonState: "running",
+						QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 					},
 					CollectionError: "",
 					LastUpdated:     metav1.Time{Time: time.Now().Add(-5 * time.Minute)},
@@ -238,15 +238,15 @@ func TestHealthCheck_getPacemakerStatus(t *testing.T) {
 		},
 		{
 			name: "nil_status",
-			mockStatus: &v1alpha1.PacemakerStatus{
+			mockStatus: &v1alpha1.PacemakerCluster{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1alpha1.SchemeGroupVersion.String(),
-					Kind:       "PacemakerStatus",
+					Kind:       "PacemakerCluster",
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "cluster",
 				},
-				Status: nil, // Status not populated yet
+				// Status is zero value // Status not populated yet
 			},
 			expectedStatus: statusUnknown,
 			expectErrors:   true,
@@ -594,24 +594,24 @@ func TestHealthCheck_buildHealthStatusFromCR(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with healthy cluster status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "running",
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "running",
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
-			Resources: []v1alpha1.ResourceStatus{
+			Resources: []v1alpha1.PacemakerResourceStatus{
 				{Name: "kubelet-clone-0", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "kubelet-clone-1", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 				{Name: "etcd-clone-0", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "etcd-clone-1", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 			},
-			NodeHistory:    []v1alpha1.NodeHistoryEntry{},
-			FencingHistory: []v1alpha1.FencingEvent{},
+			NodeHistory:    []v1alpha1.PacemakerNodeHistoryEntry{},
+			FencingHistory: []v1alpha1.PacemakerFencingEvent{},
 		},
 	}
 
@@ -627,13 +627,13 @@ func TestHealthCheck_buildHealthStatusFromCR_OfflineNode(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with offline node status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "running",
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "running",
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOffline, Mode: v1alpha1.NodeModeActive},
 			},
@@ -652,13 +652,13 @@ func TestHealthCheck_buildHealthStatusFromCR_StandbyNode(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with standby node status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "running",
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "running",
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeStandby},
 			},
@@ -679,26 +679,26 @@ func TestHealthCheck_buildHealthStatusFromCR_RecentFailures(t *testing.T) {
 	// Test with recent failures in status
 	now := metav1.Now()
 	rc1 := int32(1)
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "running",
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "running",
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
-			Resources: []v1alpha1.ResourceStatus{
+			Resources: []v1alpha1.PacemakerResourceStatus{
 				{Name: "kubelet-clone-0", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "kubelet-clone-1", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 				{Name: "etcd-clone-0", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "etcd-clone-1", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 			},
-			NodeHistory: []v1alpha1.NodeHistoryEntry{
+			NodeHistory: []v1alpha1.PacemakerNodeHistoryEntry{
 				{Node: "master-0", Resource: "etcd-clone-0", Operation: "monitor", RC: &rc1, RCText: "error", LastRCChange: now},
 			},
-			FencingHistory: []v1alpha1.FencingEvent{
+			FencingHistory: []v1alpha1.PacemakerFencingEvent{
 				{Target: "master-1", Action: "reboot", Status: "success", Completed: now},
 			},
 		},
@@ -730,10 +730,10 @@ func TestHealthCheck_buildHealthStatusFromCR_NilSummary(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with nil Summary - should return Unknown status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: nil, // No summary data available
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
 		},
@@ -751,13 +751,13 @@ func TestHealthCheck_buildHealthStatusFromCR_EmptyPacemakerdState(t *testing.T) 
 	controller := &HealthCheck{}
 
 	// Test with empty PacemakerdState - should return Unknown status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "", // Empty state
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "", // Empty state
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
 		},
@@ -775,13 +775,13 @@ func TestHealthCheck_buildHealthStatusFromCR_PacemakerNotRunning(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with pacemaker not running - should return Error status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "stopped", // Not running
-				QuorumStatus:    v1alpha1.QuorumStatusQuorate,
+				PacemakerDaemonState: "stopped", // Not running
+				QuorumStatus:         v1alpha1.QuorumStatusQuorate,
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
 		},
@@ -799,17 +799,17 @@ func TestHealthCheck_buildHealthStatusFromCR_NoQuorum(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with no quorum - should return Error status
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
 			Summary: &v1alpha1.PacemakerSummary{
-				PacemakerdState: "running",
-				QuorumStatus:    v1alpha1.QuorumStatusNoQuorum, // No quorum
+				PacemakerDaemonState: "running",
+				QuorumStatus:         v1alpha1.QuorumStatusNoQuorum, // No quorum
 			},
-			Nodes: []v1alpha1.NodeStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
-			Resources: []v1alpha1.ResourceStatus{
+			Resources: []v1alpha1.PacemakerResourceStatus{
 				{Name: "kubelet-clone-0", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "kubelet-clone-1", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 				{Name: "etcd-clone-0", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
@@ -829,26 +829,28 @@ func TestHealthCheck_buildHealthStatusFromCR_NoQuorum(t *testing.T) {
 func TestHealthCheck_buildHealthStatusFromCR_NilStatus(t *testing.T) {
 	controller := &HealthCheck{}
 
-	// Test defensive check for nil Status (shouldn't happen in practice but good to test)
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: nil, // Nil status
+	// Test with zero-value Status (all fields empty)
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			// Zero value - all fields empty
+		},
 	}
 
 	status := controller.buildHealthStatusFromCR(pacemakerStatus)
 
 	require.NotNil(t, status, "HealthStatus should not be nil")
-	require.Equal(t, statusUnknown, status.OverallStatus, "Status should be Unknown when Status is nil")
-	require.NotEmpty(t, status.Errors, "Should have internal error when Status is nil")
-	require.Contains(t, status.Errors, "Internal error: nil Status in buildHealthStatusFromCR", "Should have specific internal error message")
+	require.Equal(t, statusUnknown, status.OverallStatus, "Status should be Unknown when Status fields are empty")
+	// Zero-value Status with no summary data means unknown status, not an error
+	require.Empty(t, status.Errors, "Should have no errors when Status is zero value (missing data = unknown)")
 }
 
 func TestHealthCheck_checkNodeStatus(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with healthy nodes
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Nodes: []v1alpha1.NodeStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 			},
@@ -866,9 +868,9 @@ func TestHealthCheck_checkNodeStatus_MismatchedCount(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Create status with only 1 node (mismatch with expected 2)
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Nodes: []v1alpha1.NodeStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline},
 			},
 		},
@@ -886,9 +888,9 @@ func TestHealthCheck_checkNodeStatus_NoNodes(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Create status with no nodes - this should be treated as missing data, not an error
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Nodes: []v1alpha1.NodeStatus{},
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{},
 		},
 	}
 
@@ -904,9 +906,9 @@ func TestHealthCheck_checkNodeStatus_StandbyNode(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Create status with one node in standby
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Nodes: []v1alpha1.NodeStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeStandby},
 			},
@@ -924,9 +926,9 @@ func TestHealthCheck_checkNodeStatus_OfflineAndStandbyNode(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Create status with one offline node and one standby node
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Nodes: []v1alpha1.NodeStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Nodes: []v1alpha1.PacemakerNodeStatus{
 				{Name: "master-0", OnlineStatus: v1alpha1.NodeOnlineStatusOffline, Mode: v1alpha1.NodeModeActive},
 				{Name: "master-1", OnlineStatus: v1alpha1.NodeOnlineStatusOnline, Mode: v1alpha1.NodeModeStandby},
 			},
@@ -945,9 +947,9 @@ func TestHealthCheck_checkResourceStatus(t *testing.T) {
 	controller := &HealthCheck{}
 
 	// Test with healthy resources
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			Resources: []v1alpha1.ResourceStatus{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			Resources: []v1alpha1.PacemakerResourceStatus{
 				{Name: "kubelet-clone-0", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
 				{Name: "kubelet-clone-1", ResourceAgent: resourceAgentKubelet, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-1"},
 				{Name: "etcd-clone-0", ResourceAgent: resourceAgentEtcd, Role: "Started", ActiveStatus: v1alpha1.ResourceActiveStatusActive, Node: "master-0"},
@@ -1003,9 +1005,9 @@ func TestHealthCheck_checkRecentFailures(t *testing.T) {
 	// Test with recent failures
 	now := metav1.Now()
 	rc1 := int32(1)
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			NodeHistory: []v1alpha1.NodeHistoryEntry{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			NodeHistory: []v1alpha1.PacemakerNodeHistoryEntry{
 				{Node: "master-0", Resource: "etcd-clone-0", Operation: "monitor", RC: &rc1, RCText: "error", LastRCChange: now},
 			},
 		},
@@ -1030,9 +1032,9 @@ func TestHealthCheck_checkFencingEvents(t *testing.T) {
 
 	// Test with recent fencing events
 	now := metav1.Now()
-	pacemakerStatus := &v1alpha1.PacemakerStatus{
-		Status: &v1alpha1.PacemakerStatusStatus{
-			FencingHistory: []v1alpha1.FencingEvent{
+	pacemakerStatus := &v1alpha1.PacemakerCluster{
+		Status: v1alpha1.PacemakerClusterStatus{
+			FencingHistory: []v1alpha1.PacemakerFencingEvent{
 				{Target: "master-1", Action: "reboot", Status: "success", Completed: now},
 			},
 		},

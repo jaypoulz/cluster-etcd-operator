@@ -48,7 +48,7 @@ func TestBuildStatusComponents_HealthyCluster(t *testing.T) {
 	summary, nodes, resources, nodeHistory, fencingHistory := buildStatusComponents(&result)
 
 	// Verify summary
-	require.Equal(t, pacemakerStateRunning, summary.PacemakerdState)
+	require.Equal(t, v1alpha1.PacemakerDaemonStateRunning, summary.PacemakerDaemonState)
 	require.Equal(t, v1alpha1.QuorumStatusQuorate, summary.QuorumStatus)
 	require.NotNil(t, summary.NodesOnline)
 	require.Equal(t, int32(2), *summary.NodesOnline)
@@ -94,7 +94,7 @@ func TestBuildStatusComponents_OfflineNode(t *testing.T) {
 	summary, nodes, _, _, _ := buildStatusComponents(&result)
 
 	// Verify summary shows reduced online count
-	require.Equal(t, pacemakerStateRunning, summary.PacemakerdState)
+	require.Equal(t, v1alpha1.PacemakerDaemonStateRunning, summary.PacemakerDaemonState)
 	require.NotNil(t, summary.NodesOnline)
 	require.Equal(t, int32(1), *summary.NodesOnline, "Only one node should be online")
 	require.NotNil(t, summary.NodesTotal)
@@ -175,7 +175,7 @@ func TestBuildStatusComponents_TimeWindowFiltering(t *testing.T) {
 
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 		},
 		Nodes: Nodes{
@@ -239,7 +239,7 @@ func TestBuildStatusComponents_TimeWindowFiltering(t *testing.T) {
 func TestBuildStatusComponents_ResourceCounting(t *testing.T) {
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 		},
 		Nodes: Nodes{
@@ -310,7 +310,7 @@ func TestBuildStatusComponents_ResourceCounting(t *testing.T) {
 func TestBuildStatusComponents_EmptyXML(t *testing.T) {
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueFalse},
 		},
 	}
@@ -318,7 +318,7 @@ func TestBuildStatusComponents_EmptyXML(t *testing.T) {
 	summary, nodes, resources, nodeHistory, fencingHistory := buildStatusComponents(result)
 
 	// Verify minimal valid result
-	require.Equal(t, pacemakerStateRunning, summary.PacemakerdState)
+	require.Equal(t, v1alpha1.PacemakerDaemonStateRunning, summary.PacemakerDaemonState)
 	require.Equal(t, v1alpha1.QuorumStatusNoQuorum, summary.QuorumStatus)
 	require.NotNil(t, summary.NodesOnline)
 	require.Equal(t, int32(0), *summary.NodesOnline)
@@ -346,7 +346,7 @@ func TestBuildStatusComponents_QuorumHandling(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := &PacemakerResult{
 				Summary: Summary{
-					Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+					Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 					CurrentDC: CurrentDC{WithQuorum: tt.withQuorum},
 				},
 			}
@@ -376,7 +376,7 @@ func TestBuildStatusComponents_NodeStatusVariations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := &PacemakerResult{
 				Summary: Summary{
-					Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+					Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 					CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 				},
 				Nodes: Nodes{
@@ -416,7 +416,7 @@ func TestCollectPacemakerStatus_InvalidXMLHandling(t *testing.T) {
 func TestBuildStatusComponents_NodeIPExtraction(t *testing.T) {
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 		},
 		Nodes: Nodes{
@@ -441,13 +441,13 @@ func TestBuildStatusComponents_NodeIPExtraction(t *testing.T) {
 	_, nodes, _, _, _ := buildStatusComponents(result)
 	require.Len(t, nodes, 1)
 	require.Equal(t, "master-0", nodes[0].Name)
-	require.Equal(t, "192.168.1.10", nodes[0].IP, "IP should be extracted from node_ip attribute")
+	require.Equal(t, "192.168.1.10", nodes[0].IPv4Address, "IPv4 address should be extracted from node_ip attribute")
 }
 
 func TestBuildStatusComponents_NodeIPFiltering(t *testing.T) {
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 		},
 		Nodes: Nodes{
@@ -484,7 +484,7 @@ func TestBuildStatusComponents_NodeIPFiltering(t *testing.T) {
 	nodeNames := make(map[string]bool)
 	for _, node := range nodes {
 		nodeNames[node.Name] = true
-		require.NotEmpty(t, node.IP, "All included nodes should have an IP")
+		require.True(t, node.IPv4Address != "" || node.IPv6Address != "", "All included nodes should have an IP address (v4 or v6)")
 	}
 
 	require.True(t, nodeNames["master-0"], "master-0 should be included")
@@ -495,7 +495,7 @@ func TestBuildStatusComponents_NodeIPFiltering(t *testing.T) {
 func TestBuildStatusComponents_ResourceAgentTypes(t *testing.T) {
 	result := &PacemakerResult{
 		Summary: Summary{
-			Stack:     Stack{PacemakerdState: pacemakerStateRunning},
+			Stack:     Stack{PacemakerdState: string(v1alpha1.PacemakerDaemonStateRunning)},
 			CurrentDC: CurrentDC{WithQuorum: booleanValueTrue},
 		},
 		Resources: Resources{
