@@ -112,39 +112,51 @@ func handleNodes(
 	etcdInformer operatorv1informers.EtcdInformer,
 ) error {
 
-	// ensure we have 2 control plane nodes before doing anything
+	// Get control plane nodes
 	nodeList, err := controlPlaneNodeLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list control plane nodes: %w", err)
 	}
+
+	// Check if TNF was already set up
+	jobsExist, err := tnfSetupJobsExist(ctx, kubeClient)
+	if err != nil {
+		return fmt.Errorf("failed to check for existing TNF jobs: %w", err)
+	}
+
+	// Validate node count based on whether initial setup is complete
 	if len(nodeList) > 2 {
 		klog.Warningf("found more than 2 control plane nodes (%d), unsupported use case, no further steps are taken for now", len(nodeList))
-		// don't retry
 		return nil
 	}
-	if len(nodeList) < 2 {
-		klog.Warningf("found a single control plane node only, waiting for the second one")
-		// don't retry
+	if len(nodeList) < 1 {
+		klog.Warningf("no control plane nodes found, waiting for nodes")
 		return nil
 	}
-	bothReady := true
+	if len(nodeList) < 2 && !jobsExist {
+		// Initial setup requires 2 nodes
+		klog.Warningf("found a single control plane node only, waiting for the second one before initial setup")
+		return nil
+	}
+
+	// After initial setup, allow running with 1 or 2 nodes for reconciliation
+	// Check that all present nodes are ready
+	allReady := true
 	for _, node := range nodeList {
 		if !tools.IsNodeReady(node) {
 			klog.Warningf("node %q is not ready yet, waiting for it to become ready", node.GetName())
-			bothReady = false
+			allReady = false
 		}
 	}
-	if !bothReady {
+	if !allReady {
 		// a node condition change will retrigger node handling automatically, no need to trigger a retry here
 		return nil
 	}
 
-	klog.Infof("found 2 control plane nodes (%q, %q)", nodeList[0].GetName(), nodeList[1].GetName())
-
-	// check if TNF was already set up, by looking for existing jobs
-	jobsExist, err := tnfSetupJobsExist(ctx, kubeClient)
-	if err != nil {
-		return fmt.Errorf("failed to check for existing TNF jobs: %w", err)
+	if len(nodeList) == 1 {
+		klog.Infof("found 1 control plane node (%q), TNF already setup, will run reconciliation", nodeList[0].GetName())
+	} else {
+		klog.Infof("found 2 control plane nodes (%q, %q)", nodeList[0].GetName(), nodeList[1].GetName())
 	}
 
 	// always start job controllers, otherwise jobs won't be recreated after a CEO restart
@@ -158,7 +170,7 @@ func handleNodes(
 		return nil
 	}
 
-	// if TNF was already set up, we might need to update
+	// if TNF was already set up, we might need to update (reconcile pacemaker with k8s)
 	err = updateSetupFunc(nodeList, ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
 	if err != nil {
 		return fmt.Errorf("failed to update pacemaker setup: %w", err)
@@ -295,17 +307,32 @@ func updateSetup(
 	return nil
 }
 
-// tnfSetupJobsExist checks if TNF was already set up by checking for any existing TNF jobs
+// tnfSetupJobsExist checks if TNF initial setup completed by checking for completed after-setup jobs
 func tnfSetupJobsExist(ctx context.Context, kubeClient kubernetes.Interface) (bool, error) {
-	// Check if any TNF jobs exist in the target namespace
+	// Check for after-setup jobs (created last in initial setup flow)
+	// If these completed, initial setup is done
 	jobsClient := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace)
 	list, err := jobsClient.List(ctx, v1.ListOptions{
-		LabelSelector: "app.kubernetes.io/component=two-node-fencing-setup",
+		LabelSelector: "app.kubernetes.io/component=two-node-fencing-setup,app.kubernetes.io/name=tnf-after-setup",
 	})
 	if err != nil {
 		return false, err
 	}
-	return len(list.Items) > 0, nil
+
+	// If no after-setup jobs exist, initial setup not started
+	if len(list.Items) == 0 {
+		return false, nil
+	}
+
+	// Check if at least one after-setup job completed successfully
+	for _, job := range list.Items {
+		if job.Status.Succeeded > 0 {
+			return true, nil
+		}
+	}
+
+	// Jobs exist but none completed - initial setup in progress or failed
+	return false, nil
 }
 
 func waitForTnfAfterSetupJobsCompletion(ctx context.Context, kubeClient kubernetes.Interface, nodeList []*corev1.Node) error {

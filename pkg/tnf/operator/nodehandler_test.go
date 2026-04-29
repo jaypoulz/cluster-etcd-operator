@@ -44,7 +44,7 @@ func TestHandleNodes(t *testing.T) {
 		errorContains          string
 	}{
 		{
-			name: "Less than 2 nodes - returns nil without action",
+			name: "1 node, no jobs - initial setup not complete - skip",
 			nodes: []*corev1.Node{
 				createReadyNode("master-0"),
 			},
@@ -52,6 +52,24 @@ func TestHandleNodes(t *testing.T) {
 			expectError:            false,
 			expectStartControllers: false,
 			expectUpdateSetup:      false,
+		},
+		{
+			name: "1 node, jobs exist - after initial setup - run reconciliation",
+			nodes: []*corev1.Node{
+				createReadyNode("master-0"),
+			},
+			existingJobs: []runtime.Object{
+				createTNFJob("tnf-after-setup-master-0"),
+			},
+			mockStartControllers: func() error {
+				return nil
+			},
+			mockUpdateSetup: func() error {
+				return nil
+			},
+			expectError:            false,
+			expectStartControllers: true,
+			expectUpdateSetup:      true,
 		},
 		{
 			name: "More than 2 nodes - returns nil without action",
@@ -108,7 +126,8 @@ func TestHandleNodes(t *testing.T) {
 				createReadyNode("master-1"),
 			},
 			existingJobs: []runtime.Object{
-				createTNFJob("tnf-setup"),
+				createTNFJob("tnf-after-setup-master-0"),
+				createTNFJob("tnf-after-setup-master-1"),
 			},
 			mockStartControllers: func() error {
 				return nil
@@ -142,7 +161,8 @@ func TestHandleNodes(t *testing.T) {
 				createReadyNode("master-1"),
 			},
 			existingJobs: []runtime.Object{
-				createTNFJob("tnf-setup"),
+				createTNFJob("tnf-after-setup-master-0"),
+				createTNFJob("tnf-after-setup-master-1"),
 			},
 			mockStartControllers: func() error {
 				return nil
@@ -331,13 +351,22 @@ func createNotReadyNode(name string) *corev1.Node {
 }
 
 func createTNFJob(name string) *batchv1.Job {
+	labels := map[string]string{
+		"app.kubernetes.io/component": "two-node-fencing-setup",
+	}
+	// Mark after-setup jobs to indicate initial setup completion
+	if name == "tnf-after-setup" || name == "tnf-after-setup-master-0" || name == "tnf-after-setup-master-1" {
+		labels["app.kubernetes.io/name"] = "tnf-after-setup"
+	}
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: operatorclient.TargetNamespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/component": "two-node-fencing-setup",
-			},
+			Labels:    labels,
+		},
+		Status: batchv1.JobStatus{
+			Succeeded: 1, // Mark as completed
 		},
 	}
 }
