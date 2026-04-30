@@ -74,7 +74,8 @@ func RunTnfUpdateSetup() error {
 	}
 
 	// Get current cluster config from Kubernetes
-	cfg, err := config.GetClusterConfig(ctx, kubeClient)
+	// Use GetClusterConfigIgnoreMissingNode to allow single-node operation
+	cfg, err := config.GetClusterConfigIgnoreMissingNode(ctx, kubeClient)
 	if err != nil {
 		return err
 	}
@@ -93,11 +94,19 @@ func RunTnfUpdateSetup() error {
 		return fmt.Errorf("current node %s not found in cluster config (nodes: %s, %s)", currentNodeName, cfg.NodeName1, cfg.NodeName2)
 	}
 
+	// Check if running in single-node mode
+	isSingleNode := cfg.NodeName2 == ""
+	if isSingleNode {
+		klog.Info("Running in single-node mode")
+	}
+
 	// Reconcile pacemaker membership with Kubernetes
 	// Get k8s nodes from cluster config
 	k8sNodes := map[string]struct{}{
 		cfg.NodeName1: {},
-		cfg.NodeName2: {},
+	}
+	if !isSingleNode {
+		k8sNodes[cfg.NodeName2] = struct{}{}
 	}
 
 	// Get pacemaker cluster membership using XML output
@@ -120,16 +129,6 @@ func RunTnfUpdateSetup() error {
 	for _, node := range pacemakerStatus.Nodes.Node {
 		pacemakerNodes[node.Name] = struct{}{}
 		klog.Infof("Found pacemaker node: %q (online=%q)", node.Name, node.Online)
-	}
-
-	// Helper function to get node IP from cluster config
-	getNodeIP := func(nodeName string) (string, error) {
-		if cfg.NodeName1 == nodeName {
-			return cfg.NodeIP1, nil
-		} else if cfg.NodeName2 == nodeName {
-			return cfg.NodeIP2, nil
-		}
-		return "", fmt.Errorf("node %s not found in cluster config (nodes: %s, %s)", nodeName, cfg.NodeName1, cfg.NodeName2)
 	}
 
 	// Determine what changes are needed using reconciliation logic
@@ -176,8 +175,16 @@ func RunTnfUpdateSetup() error {
 			klog.Infof("Successfully removed node %q from pacemaker", nodeToRemove)
 		}
 
-		// Remove etcd members for all removed nodes
-		if err := removeEtcdMembersForNodes(ctx, nodesToRemove, getNodeIP); err != nil {
+		// Build set of current node IPs
+		currentNodeIPs := map[string]struct{}{
+			cfg.NodeIP1: {},
+		}
+		if !isSingleNode {
+			currentNodeIPs[cfg.NodeIP2] = struct{}{}
+		}
+
+		// Remove unstarted etcd members (from deleted nodes)
+		if err := removeUnstartedEtcdMembers(ctx, currentNodeIPs); err != nil {
 			return err
 		}
 		return nil
@@ -209,25 +216,47 @@ func RunTnfUpdateSetup() error {
 	// update fence devices
 	// this is needed for being able to start resources on the new node!
 	// node order matters here: resources can't be restarted while fencing isn't configured on all nodes!
-	err = pcs.ConfigureFencing(ctx, kubeClient, []string{otherNodeName, currentNodeName})
+	var fencingNodes []string
+	if isSingleNode {
+		fencingNodes = []string{currentNodeName}
+	} else {
+		fencingNodes = []string{otherNodeName, currentNodeName}
+	}
+	err = pcs.ConfigureFencing(ctx, kubeClient, fencingNodes)
 	if err != nil {
 		klog.Error(err, "Failed to configure fencing, skipping update of etcd! Restart update-setup job when fencing config is fixed!")
 		return err
+	}
+
+	// Build node_ip_map parameter
+	var nodeIPMap string
+	if isSingleNode {
+		nodeIPMap = fmt.Sprintf("%s:%s", cfg.NodeName1, cfg.NodeIP1)
+	} else {
+		nodeIPMap = fmt.Sprintf("%s:%s;%s:%s", cfg.NodeName1, cfg.NodeIP1, cfg.NodeName2, cfg.NodeIP2)
 	}
 
 	commands = []string{
 		// Force new cluster on next etcd restart on this node
 		fmt.Sprintf("crm_attribute --lifetime reboot --node %s --name \"force_new_cluster\" --update %s", currentNodeName, currentNodeName),
 		// Update etcd resource
-		fmt.Sprintf("/usr/sbin/pcs resource update etcd node_ip_map=\"%s:%s;%s:%s\" --wait=300", cfg.NodeName1, cfg.NodeIP1, cfg.NodeName2, cfg.NodeIP2),
+		fmt.Sprintf("/usr/sbin/pcs resource update etcd node_ip_map=\"%s\" --wait=300", nodeIPMap),
 	}
 	err = runCommands(ctx, commands)
 	if err != nil {
 		return err
 	}
 
-	// Remove etcd members for all removed nodes
-	if err := removeEtcdMembersForNodes(ctx, nodesToRemove, getNodeIP); err != nil {
+	// Build set of current node IPs
+	currentNodeIPs := map[string]struct{}{
+		cfg.NodeIP1: {},
+	}
+	if !isSingleNode {
+		currentNodeIPs[cfg.NodeIP2] = struct{}{}
+	}
+
+	// Remove unstarted etcd members (from deleted nodes)
+	if err := removeUnstartedEtcdMembers(ctx, currentNodeIPs); err != nil {
 		return err
 	}
 
@@ -287,15 +316,12 @@ func runCommands(ctx context.Context, commands []string) error {
 	return nil
 }
 
-// removeEtcdMembersForNodes removes unstarted etcd members after nodes are removed from pacemaker
-// When a node is removed from pacemaker, its etcd member becomes unstarted
-// This function cleans up all unstarted members, which handles both current-config and stale nodes
-func removeEtcdMembersForNodes(ctx context.Context, nodeNames []string, getNodeIP func(string) (string, error)) error {
-	if len(nodeNames) == 0 {
-		return nil
-	}
-
-	klog.Infof("Removing etcd members for removed nodes: %v", nodeNames)
+// removeUnstartedEtcdMembers removes unstarted etcd members that don't match any current k8s node.
+// When a node is removed from pacemaker, its etcd member becomes unstarted (empty name).
+// This function removes all such unstarted members whose IP doesn't match any node in currentNodeIPs,
+// cleaning up stale members from deleted nodes while preserving members for current nodes.
+func removeUnstartedEtcdMembers(ctx context.Context, currentNodeIPs map[string]struct{}) error {
+	klog.Info("Checking for unstarted etcd members to remove")
 
 	// Get etcd member list
 	command := "podman exec etcd /usr/bin/etcdctl member list -w json"
@@ -319,94 +345,60 @@ func removeEtcdMembersForNodes(ctx context.Context, nodeNames []string, getNodeI
 		return fmt.Errorf("failed to parse etcd member list JSON: %w", err)
 	}
 
-	// Remove all unstarted members (empty name indicates unstarted)
-	// After removing nodes from pacemaker, their etcd members become unstarted
+	// Remove all unstarted members that don't match any current node
 	var removed []string
 	for _, member := range memberList.Members {
-		if member.Name == "" {
-			memberIDHex := fmt.Sprintf("%x", member.ID)
-			klog.Infof("Found unstarted etcd member %s with peer URLs %v", memberIDHex, member.PeerURLs)
-
-			command = fmt.Sprintf("podman exec etcd /usr/bin/etcdctl member remove %s", memberIDHex)
-			stdOut, stdErr, err = exec.Execute(ctx, command)
-			if err != nil {
-				return fmt.Errorf("failed to remove unstarted etcd member %s: stdout: %s, stderr: %s, err: %w", memberIDHex, stdOut, stdErr, err)
-			}
-			removed = append(removed, memberIDHex)
-			klog.Infof("Removed unstarted etcd member %s", memberIDHex)
+		// Only consider unstarted members (empty name indicates unstarted)
+		if member.Name != "" {
+			continue
 		}
+
+		memberIDHex := fmt.Sprintf("%x", member.ID)
+
+		// Extract IP from peer URLs
+		var memberIP string
+		for _, peerURLStr := range member.PeerURLs {
+			parsedURL, err := url.Parse(peerURLStr)
+			if err != nil {
+				continue
+			}
+
+			host, _, err := net.SplitHostPort(parsedURL.Host)
+			if err != nil {
+				host = parsedURL.Host
+			}
+			host = strings.Trim(host, "[]")
+			memberIP = host
+			break
+		}
+
+		if memberIP == "" {
+			klog.Warningf("Could not extract IP from unstarted member %s peer URLs: %v", memberIDHex, member.PeerURLs)
+			continue
+		}
+
+		// Check if this IP matches any current node
+		if _, isCurrentNode := currentNodeIPs[memberIP]; isCurrentNode {
+			klog.Infof("Unstarted etcd member %s (IP: %s) matches a current node - not removing", memberIDHex, memberIP)
+			continue
+		}
+
+		// This is an unstarted member for a removed/stale node - remove it
+		klog.Infof("Found unstarted etcd member %s (IP: %s) not matching any current node - removing", memberIDHex, memberIP)
+		command = fmt.Sprintf("podman exec etcd /usr/bin/etcdctl member remove %s", memberIDHex)
+		stdOut, stdErr, err = exec.Execute(ctx, command)
+		if err != nil {
+			return fmt.Errorf("failed to remove unstarted etcd member %s: stdout: %s, stderr: %s, err: %w", memberIDHex, stdOut, stdErr, err)
+		}
+		removed = append(removed, fmt.Sprintf("%s (IP: %s)", memberIDHex, memberIP))
+		klog.Infof("Removed unstarted etcd member %s", memberIDHex)
 	}
 
 	if len(removed) == 0 {
-		klog.Info("No unstarted etcd members found - may have already been removed")
+		klog.Info("No unstarted etcd members found for removed nodes")
 	} else {
 		klog.Infof("Successfully removed %d unstarted etcd member(s): %v", len(removed), removed)
 	}
 
-	return nil
-}
-
-// removeEtcdMemberByIP finds and removes an etcd member by matching its IP address
-func removeEtcdMemberByIP(ctx context.Context, nodeIP string) error {
-	// Get etcd member list in JSON format
-	command := "podman exec etcd /usr/bin/etcdctl member list -w json"
-	stdOut, stdErr, err := exec.Execute(ctx, command)
-	if err != nil {
-		return fmt.Errorf("failed to list etcd members: stdout: %s, stderr: %s, err: %w", stdOut, stdErr, err)
-	}
-
-	// Parse JSON response
-	var memberList struct {
-		Members []struct {
-			ID         uint64   `json:"ID"`
-			Name       string   `json:"name"`
-			PeerURLs   []string `json:"peerURLs"`
-			ClientURLs []string `json:"clientURLs"`
-		} `json:"members"`
-	}
-
-	if err := json.Unmarshal([]byte(stdOut), &memberList); err != nil {
-		return fmt.Errorf("failed to parse etcd member list JSON: %w", err)
-	}
-
-	// Find member with matching IP in peer URLs
-	for _, member := range memberList.Members {
-		for _, peerURLStr := range member.PeerURLs {
-			// Parse the peer URL to extract host
-			parsedURL, err := url.Parse(peerURLStr)
-			if err != nil {
-				klog.Warningf("Failed to parse peer URL %q: %v", peerURLStr, err)
-				continue
-			}
-
-			// Extract host, handling IPv6 brackets and port
-			host, _, err := net.SplitHostPort(parsedURL.Host)
-			if err != nil {
-				// No port present, Host is just the hostname/IP
-				host = parsedURL.Host
-			}
-
-			// Remove IPv6 brackets if present
-			host = strings.Trim(host, "[]")
-
-			// Compare host exactly with nodeIP
-			if host == nodeIP {
-				// Convert uint64 ID to hex string format
-				memberIDHex := fmt.Sprintf("%x", member.ID)
-				klog.Infof("Found etcd member %s (name: %q) with IP %s in peer URL %s", memberIDHex, member.Name, nodeIP, peerURLStr)
-
-				command = fmt.Sprintf("podman exec etcd /usr/bin/etcdctl member remove %s", memberIDHex)
-				stdOut, stdErr, err = exec.Execute(ctx, command)
-				if err != nil {
-					return fmt.Errorf("failed to remove etcd member %s: stdout: %s, stderr: %s, err: %w", memberIDHex, stdOut, stdErr, err)
-				}
-				klog.Infof("Removed etcd member %s", memberIDHex)
-				return nil
-			}
-		}
-	}
-
-	// If we get here, no member matched the IP
-	klog.Warningf("No etcd member found with IP %s - member may have already been removed", nodeIP)
 	return nil
 }

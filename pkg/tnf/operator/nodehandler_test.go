@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,18 @@ func TestHandleNodes(t *testing.T) {
 			expectUpdateSetup:      true,
 		},
 		{
+			name: "1 node, after-setup job in progress - skip reconciliation",
+			nodes: []*corev1.Node{
+				createReadyNode("master-0"),
+			},
+			existingJobs: []runtime.Object{
+				createTNFJobWithStatus("tnf-after-setup-master-0", 0), // Job exists but not completed
+			},
+			expectError:            false,
+			expectStartControllers: false,
+			expectUpdateSetup:      false,
+		},
+		{
 			name: "More than 2 nodes - returns nil without action",
 			nodes: []*corev1.Node{
 				createReadyNode("master-0"),
@@ -118,6 +131,22 @@ func TestHandleNodes(t *testing.T) {
 			expectError:            false,
 			expectStartControllers: true,
 			expectUpdateSetup:      false,
+		},
+		{
+			name: "2 ready nodes, setup jobs exist but no after-setup - start controllers only",
+			nodes: []*corev1.Node{
+				createReadyNode("master-0"),
+				createReadyNode("master-1"),
+			},
+			existingJobs: []runtime.Object{
+				createTNFJob("tnf-setup-master-0"), // setup job exists but not after-setup
+			},
+			mockStartControllers: func() error {
+				return nil
+			},
+			expectError:            false,
+			expectStartControllers: true,
+			expectUpdateSetup:      false, // No after-setup job, so no reconciliation
 		},
 		{
 			name: "2 ready nodes, existing jobs - starts controllers and updates setup",
@@ -351,11 +380,15 @@ func createNotReadyNode(name string) *corev1.Node {
 }
 
 func createTNFJob(name string) *batchv1.Job {
+	return createTNFJobWithStatus(name, 1)
+}
+
+func createTNFJobWithStatus(name string, succeeded int32) *batchv1.Job {
 	labels := map[string]string{
 		"app.kubernetes.io/component": "two-node-fencing-setup",
 	}
 	// Mark after-setup jobs to indicate initial setup completion
-	if name == "tnf-after-setup" || name == "tnf-after-setup-master-0" || name == "tnf-after-setup-master-1" {
+	if strings.HasPrefix(name, "tnf-after-setup") {
 		labels["app.kubernetes.io/name"] = "tnf-after-setup"
 	}
 
@@ -366,7 +399,7 @@ func createTNFJob(name string) *batchv1.Job {
 			Labels:    labels,
 		},
 		Status: batchv1.JobStatus{
-			Succeeded: 1, // Mark as completed
+			Succeeded: succeeded,
 		},
 	}
 }
