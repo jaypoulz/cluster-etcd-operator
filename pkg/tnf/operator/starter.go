@@ -165,33 +165,11 @@ func runTnfResourceController(ctx context.Context, controllerContext *controller
 }
 
 func runPacemakerControllers(ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, etcdInformer operatorv1informers.EtcdInformer, nodeInformer cache.SharedIndexInformer) {
-	// Pacemaker controllers start after: (1) external etcd transition completes, (2) PacemakerCluster CRD is established.
+	// Pacemaker controllers start after PacemakerCluster CRD is established.
+	// The lifecycle manager's sync() handles bootstrap vs post-transition modes internally.
 	// This runs in a background goroutine to avoid blocking the main thread.
 	go func() {
-		klog.Infof("waiting for prerequisites before starting Pacemaker controllers (etcd transition, CRD established)")
-
-		// Wait for external etcd transition to complete.
-		for {
-			if err := ceohelpers.WaitForEtcdCondition(
-				ctx, etcdInformer, operatorClient, ceohelpers.HasExternalEtcdCompletedTransition,
-				10*time.Second, 30*time.Minute, "external etcd transition",
-			); err != nil {
-				if ctx.Err() != nil {
-					klog.Infof("context done while waiting for external etcd transition: %v", err)
-					return
-				}
-				klog.Warningf("external etcd transition not complete yet, will retry in 1m: %v", err)
-				select {
-				case <-time.After(time.Minute):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-			break
-		}
-
-		klog.Infof("etcd has transitioned to external; verifying PacemakerCluster CRD is established")
+		klog.Infof("waiting for PacemakerCluster CRD to be established before starting Pacemaker controllers")
 
 		// The PacemakerCluster CRD is applied by the static resource controller.
 		// Wait for it to be established before starting the informer.
@@ -255,7 +233,9 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 		go pacemakerInformer.Run(ctx.Done())
 
 		// Start the lifecycle manager controller.
-		// PacemakerLifecycleManager handles: (1) Ready transitions for bootstrap, (2) Add/Delete for drift reconciliation.
+		// PacemakerLifecycleManager.sync() handles both bootstrap and post-transition:
+		// - Bootstrap: StartJobControllers() drives external etcd transition
+		// - Post-transition: MonitorHealth(), ReconcilePacemakerConfig(), CleanupOrphanedJobs()
 		go lifecycleController.Run(ctx, 1)
 
 		// Start the status collector CronJob.

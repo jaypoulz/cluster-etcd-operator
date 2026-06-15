@@ -54,6 +54,44 @@ pkg/tnf/operator/
 
 ---
 
+## Controller Startup
+
+**Function:** `runPacemakerControllers()`  
+**File:** `pkg/tnf/operator/starter.go`  
+**Trigger:** Called during operator initialization
+
+Before the lifecycle manager can start managing pacemaker, the PacemakerCluster CRD must be established. This startup sequence runs in a background goroutine to avoid blocking the main operator thread.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ runPacemakerControllers()                                   │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+        Wait for PacemakerCluster CRD to be established
+        (applied by static resource controller)
+                    │
+                    ▼
+        NewPacemakerLifecycleManager()
+        (creates controller, manager, informer)
+                    │
+                    ▼
+        Start PacemakerCluster informer
+        (go pacemakerInformer.Run())
+                    │
+                    ▼
+        Start lifecycle manager controller
+        (go lifecycleController.Run())
+                    │
+                    ▼
+        Start status collector CronJob
+        (creates CronJob for periodic pcs status xml collection)
+```
+
+**Important:** The lifecycle manager does NOT wait for external etcd transition before starting. The `sync()` function handles both bootstrap (drives the transition) and post-transition (health monitoring, drift reconciliation) modes internally.
+
+---
+
 ## Periodic Sync
 
 **Function:** `sync()`  
