@@ -24,6 +24,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
 )
 
 // TestDetermineReconciliationActions tests the reconciliation action decision logic.
@@ -123,7 +125,7 @@ func TestDetermineReconciliationActions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nodesToRemove, nodesToAdd := determineReconciliationActions(tt.k8sNodes, tt.pacemakerNodes)
+			nodesToRemove, nodesToAdd := tools.DetermineReconciliationActions(tt.k8sNodes, tt.pacemakerNodes)
 
 			// Use ElementsMatch for order-independent comparison
 			require.ElementsMatch(t, tt.expectRemove, nodesToRemove,

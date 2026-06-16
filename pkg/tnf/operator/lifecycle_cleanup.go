@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -92,17 +91,4 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedJobs(ctx context.Context, k8s
 	}
 
 	return errors.NewAggregate(errs)
-}
-
-// isJobStopped returns true if a job has completed or failed.
-func isJobStopped(job batchv1.Job) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }

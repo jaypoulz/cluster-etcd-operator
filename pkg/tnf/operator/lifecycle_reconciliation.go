@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -35,6 +38,7 @@ var (
 
 // ReconcilePacemakerConfig performs drift detection and reconciliation after external etcd transition completes.
 // Compares K8s node state with pacemaker membership and triggers update-setup if drift is detected.
+// Also handles orphaned jobs by starting JobController to reconcile operator conditions.
 // This method is called:
 //  1. Periodically from sync() (every 30s)
 //  2. On node Add events
@@ -85,16 +89,44 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 		return nil
 	}
 
+	// Check for stopped update-setup job from previous run (handles perma-degraded/perma-progressing)
+	// This needs to run on every sync to catch jobs that stopped while operator was down
+	stoppedJob, err := c.getStoppedUpdateSetupJob(ctx)
+	if err != nil {
+		klog.Warningf("Failed to check for stopped update-setup job: %v", err)
+		// Don't return error - continue with drift detection
+	}
+
 	// Detect drift (compares node names and IPs)
 	hasDrift := c.detectDrift(k8sNodes, pacemakerNodes)
-	if !hasDrift {
-		klog.V(4).Infof("No drift detected between K8s (%d nodes) and pacemaker (%d nodes)",
-			len(k8sNodes), len(pacemakerNodes))
+
+	// Determine if we need to take action
+	needsReconciliation := false
+	var reason string
+
+	// Reason 1: Stopped unsuccessful job exists
+	if stoppedJob != nil && !jobs.IsComplete(*stoppedJob) {
+		needsReconciliation = true
+		reason = fmt.Sprintf("stopped unsuccessful job %s exists", stoppedJob.Name)
+	}
+
+	// Reason 2: Drift detected
+	if hasDrift {
+		needsReconciliation = true
+		if reason == "" {
+			reason = fmt.Sprintf("drift detected between K8s (%d nodes) and pacemaker (%d nodes)", len(k8sNodes), len(pacemakerNodes))
+		} else {
+			reason = fmt.Sprintf("%s AND drift detected", reason)
+		}
+	}
+
+	// If no action needed, return early
+	if !needsReconciliation {
+		klog.V(4).Infof("No reconciliation needed - no drift and no stopped jobs")
 		return nil
 	}
 
-	klog.Infof("Detected drift between K8s (%d nodes) and pacemaker (%d nodes) - checking if reconciliation needed",
-		len(k8sNodes), len(pacemakerNodes))
+	klog.Infof("Reconciliation needed: %s", reason)
 
 	// Serialize reconciliation trigger to prevent time-of-check-time-of-use race between drift detection
 	// and update-setup start. Multiple concurrent callers can detect drift, but only one should check-and-trigger at a time.
@@ -109,6 +141,34 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 
 	if isRunning {
 		klog.V(2).Infof("Update-setup already running, skipping reconciliation trigger")
+		return nil
+	}
+
+	// Re-check drift and stopped job after acquiring lock (another goroutine may have changed state)
+	stoppedJob, err = c.getStoppedUpdateSetupJob(ctx)
+	if err != nil {
+		klog.Warningf("Failed to re-check for stopped update-setup job: %v", err)
+	}
+	hasDrift = c.detectDrift(k8sNodes, pacemakerNodes)
+
+	// Decision tree:
+	// 1. If drift exists → run updateSetup (creates ConfigMap + calls RestartJobOrRunController)
+	// 2. If stopped unsuccessful job but NO drift → delete job (cluster is correct, stale failure)
+	// 3. Otherwise → nothing to do
+
+	if hasDrift {
+		klog.Infof("Drift detected - triggering update-setup reconciliation")
+		// Continue to existing updateSetup flow below...
+	} else if stoppedJob != nil && !jobs.IsComplete(*stoppedJob) {
+		// No drift, but stopped unsuccessful job exists - cluster is correct, just delete the stale job
+		klog.Infof("No drift detected, but stopped job %s exists - deleting stale job to clear conditions", stoppedJob.Name)
+		if err := jobs.DeleteAndWait(ctx, c.kubeClient, stoppedJob.Name, operatorclient.TargetNamespace); err != nil {
+			return fmt.Errorf("failed to delete stopped job: %w", err)
+		}
+		klog.Infof("Successfully deleted stopped job %s - JobController will clear conditions", stoppedJob.Name)
+		return nil
+	} else {
+		klog.V(4).Infof("No action needed after acquiring lock - another goroutine may have handled it")
 		return nil
 	}
 
@@ -210,7 +270,7 @@ func (c *PacemakerLifecycleManager) isUpdateSetupRunning(ctx context.Context) (b
 
 	// Check if any job is still running (not Complete and not Failed)
 	for _, job := range jobList.Items {
-		if !isJobStopped(job) {
+		if !jobs.IsStopped(job) {
 			klog.V(4).Infof("Update-setup job %s is still running", job.Name)
 			return true, nil
 		}
@@ -219,11 +279,66 @@ func (c *PacemakerLifecycleManager) isUpdateSetupRunning(ctx context.Context) (b
 	return false, nil
 }
 
+// getStoppedUpdateSetupJob returns the stopped update-setup job if one exists, nil otherwise.
+// A stopped job is one that has completed (successfully or failed).
+func (c *PacemakerLifecycleManager) getStoppedUpdateSetupJob(ctx context.Context) (*batchv1.Job, error) {
+	jobName := tools.JobTypeUpdateSetup.GetJobName(nil)
+	job, err := c.kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get update-setup job: %w", err)
+	}
+
+	if jobs.IsStopped(*job) {
+		return job, nil
+	}
+
+	return nil, nil
+}
+
 // getNextUpdateSetupGeneration increments and returns the next generation counter.
 // Caller must hold reconcilePacemakerConfigMutex.
 func getNextUpdateSetupGeneration() int64 {
 	updateSetupGeneration++
 	return updateSetupGeneration
+}
+
+// initUpdateSetupGeneration scans existing update-setup ConfigMaps and initializes the generation
+// counter to max(existing)+1 to prevent reusing stale ConfigMaps after operator restart.
+// Must be called once during lifecycle manager initialization before any reconciliation loops run.
+func (c *PacemakerLifecycleManager) initUpdateSetupGeneration(ctx context.Context) error {
+	cmList, err := c.kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).List(ctx, v1.ListOptions{
+		LabelSelector: "app.kubernetes.io/component=" + tools.TnfUpdateSetupComponentValue,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list existing update-setup ConfigMaps: %w", err)
+	}
+
+	var maxGen int64 = 0
+	for _, cm := range cmList.Items {
+		genStr := cm.Data["generation"]
+		if genStr == "" {
+			continue
+		}
+		gen, err := strconv.ParseInt(genStr, 10, 64)
+		if err != nil {
+			klog.Warningf("Found update-setup ConfigMap %s with invalid generation %q: %v", cm.Name, genStr, err)
+			continue
+		}
+		if gen > maxGen {
+			maxGen = gen
+		}
+	}
+
+	updateSetupGeneration = maxGen
+	if maxGen > 0 {
+		klog.Infof("Initialized update-setup generation counter to %d (found %d existing ConfigMaps)", maxGen, len(cmList.Items))
+	} else {
+		klog.V(2).Infof("No existing update-setup ConfigMaps found, starting generation counter at 0")
+	}
+	return nil
 }
 
 // updateSetup writes a snapshot ConfigMap, runs auth on all nodes, update-setup on one target, then after-setup on all.
@@ -252,16 +367,9 @@ func updateSetup(
 	klog.Infof("Generation %d: Target=%s, ValidTargets=%v, AllNodes=%v",
 		generation, targetNode.Name, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
 
-	// Build K8s node map (name -> IP) for reconciliation
-	k8sNodeMap := buildK8sNodeMap(allK8sNodes)
-
-	// Determine what changes are needed (this is the single source of truth for drift decisions)
-	nodesToRemove, nodesToAdd := determineReconciliationActions(k8sNodeMap, pacemakerNodes)
-
-	klog.Infof("Generation %d: Reconciliation decisions - nodesToAdd=%v, nodesToRemove=%v",
-		generation, nodesToAdd, nodesToRemove)
-
-	// Snapshot all K8s nodes into ConfigMap for the runner
+	// Snapshot K8s nodes (desired state) into ConfigMap for the runner
+	// Note: Old ConfigMaps are kept as historical record (deleted via defer after job completion)
+	// The runner will query current pacemaker state and calculate what needs to change
 	nodeListData, err := encodeNodeList(allK8sNodes)
 	if err != nil {
 		return fmt.Errorf("failed to encode node list: %w", err)
@@ -269,11 +377,9 @@ func updateSetup(
 
 	cmName := fmt.Sprintf("tnf-update-setup-%d", generation)
 	cmData := map[string]string{
-		"nodes":         nodeListData,
-		"generation":    fmt.Sprintf("%d", generation),
-		"timestamp":     time.Now().Format(time.RFC3339),
-		"nodesToAdd":    encodeStringList(nodesToAdd),
-		"nodesToRemove": encodeStringList(nodesToRemove),
+		"nodes":      nodeListData, // Desired state: which K8s nodes should be in pacemaker
+		"generation": fmt.Sprintf("%d", generation),
+		"timestamp":  time.Now().Format(time.RFC3339),
 	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: v1.ObjectMeta{
@@ -369,33 +475,6 @@ func buildK8sNodeMap(nodes []*corev1.Node) map[string]string {
 		m[node.Name] = ip
 	}
 	return m
-}
-
-// determineReconciliationActions compares K8s and pacemaker membership to determine
-// which nodes to add/remove. K8s is the source of truth.
-// Compares both name AND IP to detect replacements (same name, different IP).
-func determineReconciliationActions(k8sNodes, pacemakerNodes map[string]string) (nodesToRemove, nodesToAdd []string) {
-	// Remove: pacemaker nodes not in k8s OR with mismatched IPs
-	for nodeName, pacemakerIP := range pacemakerNodes {
-		k8sIP, existsInK8s := k8sNodes[nodeName]
-		if !existsInK8s {
-			// Node deleted from k8s
-			nodesToRemove = append(nodesToRemove, nodeName)
-		} else if !ceohelpers.IPAddressesEqual(k8sIP, pacemakerIP) {
-			// Node exists in both but IP changed - remove old, add new
-			nodesToRemove = append(nodesToRemove, nodeName)
-			nodesToAdd = append(nodesToAdd, nodeName)
-		}
-	}
-
-	// Add: k8s nodes not in pacemaker at all
-	for nodeName := range k8sNodes {
-		if _, exists := pacemakerNodes[nodeName]; !exists {
-			nodesToAdd = append(nodesToAdd, nodeName)
-		}
-	}
-
-	return nodesToRemove, nodesToAdd
 }
 
 // getJobTimeout returns the appropriate timeout for a given job type.

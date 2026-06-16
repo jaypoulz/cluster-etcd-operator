@@ -1338,7 +1338,7 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 			// Mock updateSetup
 			updateSetupCalled := false
 			originalUpdateSetup := updateSetupFunc
-			updateSetupFunc = func(validTargetNodes, allK8sNodes []*corev1.Node, ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) error {
+			updateSetupFunc = func(validTargetNodes, allK8sNodes []*corev1.Node, pacemakerNodes map[string]string, ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) error {
 				updateSetupCalled = true
 				return tt.mockUpdateSetupError
 			}

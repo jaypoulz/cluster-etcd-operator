@@ -394,8 +394,9 @@ func (c *PacemakerLifecycleManager) recordHealthTransitionEvents(current *pacema
 	// Determine previous state from the previous pacemaker.HealthStatus we computed.
 	// This is derived from the previous PacemakerCluster CR we processed.
 	// Note: previous.OverallStatus is never StatusUnknown (we only update previous for non-Unknown status).
-	// Instead, detect Unknown state by checking if CRLastUpdated is too old (same threshold as degraded status).
-	previousWasUnknown := previous == nil || time.Since(previous.CRLastUpdated) > pacemaker.StatusUnknownDegradedThreshold
+	// Instead, detect Unknown state by checking if previous is nil or if CRLastUpdated is too old (same threshold as degraded status).
+	// If CRLastUpdated is zero, treat as valid (test scenarios or in-memory status).
+	previousWasUnknown := previous == nil || (!previous.CRLastUpdated.IsZero() && time.Since(previous.CRLastUpdated) > pacemaker.StatusUnknownDegradedThreshold)
 	previousWasDegraded := previous != nil && previous.OverallStatus == pacemaker.StatusError
 	previousHadWarnings := previous != nil && len(previous.Warnings) > 0
 

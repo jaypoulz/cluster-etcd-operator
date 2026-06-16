@@ -13,7 +13,6 @@ import (
 	"time"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
-	"github.com/openshift/library-go/pkg/operator/genericoperatorclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server"
@@ -30,6 +29,7 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/exec"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pcs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
+	"github.com/openshift/library-go/pkg/operator/genericoperatorclient"
 )
 
 // pickLatestUpdateSetupConfigMap returns the ConfigMap with the highest generation.
@@ -110,8 +110,7 @@ func RunTnfUpdateSetup() error {
 	command := "/usr/sbin/pcs cluster status"
 	_, _, err = exec.Execute(ctx, command)
 	if err != nil {
-		klog.Infof("Cluster not running (err: %v), skipping update-setup on this node", err)
-		return nil
+		return fmt.Errorf("pacemaker is not running on this node %s: %w", currentNodeName, err)
 	}
 
 	// Pick the latest update-setup ConfigMap (cluster-wide, not node-specific)
@@ -169,25 +168,33 @@ func RunTnfUpdateSetup() error {
 		klog.V(2).Infof("Two-node mode - Current: %q (IP: %s), Other: %q (IP: %s)", currentNodeName, currentNodeIP, otherNodeName, otherNodeIP)
 	}
 
-	// Read reconciliation decisions from ConfigMap (pre-calculated by lifecycle_manager)
-	nodesToRemove, err := decodeStringList(cm.Data["nodesToRemove"])
-	if err != nil {
-		return fmt.Errorf("failed to decode nodesToRemove: %w", err)
+	// Build desired state from ConfigMap (K8s nodes that should be in pacemaker)
+	desiredNodes := make(map[string]string) // nodeName -> IP
+	for _, node := range capturedNodes {
+		ip, err := tools.GetNodeIPForPacemaker(*node)
+		if err != nil {
+			klog.Warningf("Skipping node %s from desired state (no valid IP): %v", node.Name, err)
+			continue
+		}
+		desiredNodes[node.Name] = ip
 	}
 
-	nodesToAdd, err := decodeStringList(cm.Data["nodesToAdd"])
+	// Get current pacemaker membership
+	currentPacemakerNodes, err := getCurrentPacemakerNodesWithIPs(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to decode nodesToAdd: %w", err)
+		return fmt.Errorf("failed to get current pacemaker membership: %w", err)
 	}
 
+	// Determine what needs to change by comparing desired vs current
+	nodesToRemove, nodesToAdd := tools.DetermineReconciliationActions(desiredNodes, currentPacemakerNodes)
+
+	klog.Infof("Reconciliation: desired=%d nodes, current=%d nodes, toAdd=%v, toRemove=%v",
+		len(desiredNodes), len(currentPacemakerNodes), nodesToAdd, nodesToRemove)
+
+	// Early exit if no changes needed
 	if len(nodesToRemove) == 0 && len(nodesToAdd) == 0 {
-		klog.Info("No membership changes needed (nodesToAdd and nodesToRemove are empty)")
-	}
-	if len(nodesToRemove) > 0 {
-		klog.Infof("Will remove: %v", nodesToRemove)
-	}
-	if len(nodesToAdd) > 0 {
-		klog.Infof("Will add: %v", nodesToAdd)
+		klog.Info("No membership changes needed (desired state matches current state)")
+		return nil
 	}
 
 	// Remove nodes from pacemaker if needed
@@ -237,15 +244,24 @@ func RunTnfUpdateSetup() error {
 	// Update etcd resource with current node IPs after any membership changes
 	// This runs once regardless of whether we removed, added, or both
 	if len(nodesToRemove) > 0 || len(nodesToAdd) > 0 {
-		nodeIPMap := buildNodeIPMap(cfg)
-		command = fmt.Sprintf("/usr/sbin/pcs resource update etcd node_ip_map=\"%s\" --wait=300", nodeIPMap)
-		stdOut, stdErr, err := exec.Execute(ctx, command)
+		desiredNodeIPMap := buildNodeIPMap(cfg)
+
+		// Check current node_ip_map to avoid unnecessary updates
+		currentNodeIPMap, err := getCurrentNodeIPMap(ctx)
 		if err != nil {
-			klog.Errorf("Failed to update etcd node_ip_map: %s, stdout: %s, stderr: %s, err: %v", command, stdOut, stdErr, err)
-			return err
+			klog.Warningf("Failed to get current node_ip_map (will attempt update): %v", err)
+		} else if currentNodeIPMap == desiredNodeIPMap {
+			klog.Infof("Skipping node_ip_map update (already set to %q)", desiredNodeIPMap)
+		} else {
+			klog.Infof("Updating node_ip_map from %q to %q", currentNodeIPMap, desiredNodeIPMap)
+			command = fmt.Sprintf("/usr/sbin/pcs resource update etcd node_ip_map=\"%s\" --wait=300", desiredNodeIPMap)
+			stdOut, stdErr, err := exec.Execute(ctx, command)
+			if err != nil {
+				klog.Errorf("Failed to update etcd node_ip_map: %s, stdout: %s, stderr: %s, err: %v", command, stdOut, stdErr, err)
+				return err
+			}
+			klog.Infof("Successfully updated etcd node_ip_map")
 		}
-		klog.Infof("Successfully updated etcd node_ip_map")
-		klog.V(2).Infof("Updated node_ip_map to %q", nodeIPMap)
 	}
 
 	// If we added nodes, force new cluster and restart
@@ -294,6 +310,35 @@ func toSet(items ...string) map[string]struct{} {
 		}
 	}
 	return s
+}
+
+// getCurrentNodeIPMap queries the current node_ip_map parameter from the etcd resource
+func getCurrentNodeIPMap(ctx context.Context) (string, error) {
+	command := "/usr/sbin/pcs resource config etcd"
+	stdOut, stdErr, err := exec.Execute(ctx, command)
+	if err != nil {
+		return "", fmt.Errorf("failed to get etcd resource config: stdout=%s, stderr=%s, err=%w", stdOut, stdErr, err)
+	}
+
+	// Parse output for node_ip_map parameter
+	// Expected format: "Attributes: etcd: node_ip_map=master-0:IP;master-1:IP ..."
+	lines := strings.Split(stdOut, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "node_ip_map=") {
+			// Extract value after node_ip_map=
+			parts := strings.SplitN(line, "node_ip_map=", 2)
+			if len(parts) == 2 {
+				// Value may have quotes and other parameters after it
+				value := strings.TrimPrefix(parts[1], "\"")
+				value = strings.SplitN(value, "\"", 2)[0] // Get text before closing quote
+				value = strings.Fields(value)[0]          // Get first word (handles unquoted case)
+				return value, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("node_ip_map parameter not found in etcd resource config")
 }
 
 // buildNodeIPMap creates the node_ip_map parameter for pacemaker
@@ -521,4 +566,70 @@ func buildClusterConfigFromNodeList(nodes []*corev1.Node) (config.ClusterConfig,
 	}
 
 	return cfg, nil
+}
+
+// getCurrentPacemakerNodesWithIPs queries pacemaker directly to get current membership with IPs.
+// Returns a map of node names to IPs.
+func getCurrentPacemakerNodesWithIPs(ctx context.Context) (map[string]string, error) {
+	// Get cluster configuration from pacemaker as JSON (more reliable than parsing corosync.conf)
+	command := "/usr/sbin/pcs cluster config show --output-format json"
+	stdOut, stdErr, err := exec.Execute(ctx, command)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster config: stdout=%s, stderr=%s, err=%w", stdOut, stdErr, err)
+	}
+
+	// Parse JSON output using same types as status collector
+	type ClusterConfigNodeAddr struct {
+		Addr string `json:"addr"`
+		Link string `json:"link"`
+		Type string `json:"type"` // "IPv4", "IPv6"
+	}
+
+	type ClusterConfigNode struct {
+		Name   string                  `json:"name"`
+		NodeID string                  `json:"nodeid"`
+		Addrs  []ClusterConfigNodeAddr `json:"addrs"`
+	}
+
+	type ClusterConfig struct {
+		ClusterName string              `json:"cluster_name"`
+		ClusterUUID string              `json:"cluster_uuid"`
+		Nodes       []ClusterConfigNode `json:"nodes"`
+	}
+
+	var config ClusterConfig
+	if err := json.Unmarshal([]byte(stdOut), &config); err != nil {
+		return nil, fmt.Errorf("failed to parse cluster config JSON: %w", err)
+	}
+
+	nodeMap := make(map[string]string)
+	for _, node := range config.Nodes {
+		if node.Name == "" {
+			klog.Warningf("Skipping node with empty name from cluster config")
+			continue
+		}
+		if len(node.Addrs) == 0 {
+			klog.Warningf("Node %s has no addresses in cluster config", node.Name)
+			continue
+		}
+		// Use first address (ring0_addr)
+		nodeMap[node.Name] = node.Addrs[0].Addr
+	}
+
+	if len(nodeMap) == 0 {
+		return nil, fmt.Errorf("no nodes found in cluster configuration")
+	}
+
+	klog.V(2).Infof("Current pacemaker cluster members from config: %v", getMapKeys(nodeMap))
+	return nodeMap, nil
+}
+
+// getMapKeys returns sorted keys from a map
+func getMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

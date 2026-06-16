@@ -144,6 +144,12 @@ func NewPacemakerLifecycleManager(
 		lifecycleCtxCancel:         lifecycleCtxCancel,
 	}
 
+	// Initialize update-setup generation counter from existing ConfigMaps
+	// This prevents reusing stale ConfigMaps after operator restart
+	if err := c.initUpdateSetupGeneration(context.Background()); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to initialize update-setup generation counter: %w", err)
+	}
+
 	syncCtx := factory.NewSyncContext(controllerNamePacemakerLifecycle, eventRecorder.WithComponentSuffix("pacemaker-lifecycle-manager"))
 
 	klog.Infof("%s controller created, waiting for informers to sync before starting", controllerNamePacemakerLifecycle)
