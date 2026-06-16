@@ -16,9 +16,7 @@ import (
 
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
-	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/exec"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
-	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pacemaker"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
 )
 
@@ -130,6 +128,7 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	return updateSetupFunc(
 		intersection,
 		k8sNodes,
+		pacemakerNodes,
 		ctx,
 		c.controllerContext,
 		c.operatorClient,
@@ -230,9 +229,11 @@ func getNextUpdateSetupGeneration() int64 {
 // updateSetup writes a snapshot ConfigMap, runs auth on all nodes, update-setup on one target, then after-setup on all.
 // validTargetNodes: nodes that can run the update-setup job (intersection of K8s and pacemaker)
 // allK8sNodes: all K8s nodes for the ConfigMap snapshot
+// pacemakerNodes: current pacemaker membership (name -> IP) from PacemakerCluster CR
 func updateSetup(
 	validTargetNodes []*corev1.Node,
 	allK8sNodes []*corev1.Node,
+	pacemakerNodes map[string]string,
 	ctx context.Context,
 	controllerContext *controllercmd.ControllerContext,
 	operatorClient v1helpers.StaticPodOperatorClient,
@@ -250,12 +251,6 @@ func updateSetup(
 
 	klog.Infof("Generation %d: Target=%s, ValidTargets=%v, AllNodes=%v",
 		generation, targetNode.Name, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
-
-	// Get current pacemaker membership to determine reconciliation actions
-	pacemakerNodes, err := getPacemakerMembership(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get pacemaker membership: %w", err)
-	}
 
 	// Build K8s node map (name -> IP) for reconciliation
 	k8sNodeMap := buildK8sNodeMap(allK8sNodes)
@@ -360,33 +355,6 @@ func runJobsOnNodes(
 	}
 
 	return nil
-}
-
-// getPacemakerMembership returns current pacemaker membership as a map of node name to IP.
-// Calls 'pcs cluster config show' on the local node via exec.Execute.
-func getPacemakerMembership(ctx context.Context) (map[string]string, error) {
-	command := "/usr/sbin/pcs cluster config show --output-format json"
-	stdOut, stdErr, err := exec.Execute(ctx, command)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pacemaker cluster config: stdout=%s, stderr=%s, err=%w", stdOut, stdErr, err)
-	}
-
-	var pacemakerConfig pacemaker.ClusterConfig
-	if err := json.Unmarshal([]byte(stdOut), &pacemakerConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse pacemaker cluster config JSON: %w", err)
-	}
-
-	// Build map of node name -> IP
-	pacemakerNodes := make(map[string]string)
-	for _, node := range pacemakerConfig.Nodes {
-		if len(node.Addrs) == 0 {
-			return nil, fmt.Errorf("node %q has no addresses in pacemaker config", node.Name)
-		}
-		// Use first address (ring0) - matches initial setup
-		pacemakerNodes[node.Name] = node.Addrs[0].Addr
-	}
-
-	return pacemakerNodes, nil
 }
 
 // buildK8sNodeMap builds a map of node name to IP from K8s nodes.

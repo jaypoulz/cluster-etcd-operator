@@ -387,7 +387,8 @@ func buildResourceStatuses(state *ResourceStatePerNode, now metav1.Time) []pacmk
 }
 
 func buildFencingAgentStatuses(agents []FencingAgentInfo, now metav1.Time) []pacmkrv1.PacemakerClusterFencingAgentStatus {
-	statuses := make([]pacmkrv1.PacemakerClusterFencingAgentStatus, 0, len(agents))
+	// Always return a non-nil slice, even if empty, to satisfy CRD validation (fencingAgents is +required)
+	statuses := []pacmkrv1.PacemakerClusterFencingAgentStatus{}
 
 	for _, agent := range agents {
 		// Fencing agents use the same condition structure as resources

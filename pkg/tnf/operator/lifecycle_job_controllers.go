@@ -10,6 +10,8 @@ import (
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -237,7 +239,25 @@ func startTnfJobcontrollers(
 
 	// wait until the after-setup jobs finished,
 	// in order to avoid races with update jobs
-	return waitForTnfAfterSetupJobsCompletion(ctx, kubeClient, nodeList)
+	if err := waitForTnfAfterSetupJobsCompletion(ctx, kubeClient, nodeList); err != nil {
+		return err
+	}
+
+	// Check if there's a stopped update-setup job from previous drift reconciliation
+	// If found, start a controller for it so it can update Progressing condition
+	updateSetupJobName := tools.JobTypeUpdateSetup.GetJobName(nil)
+	updateSetupJob, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, updateSetupJobName, metav1.GetOptions{})
+	if err == nil {
+		// Job exists - check if it's stopped (completed or failed)
+		if jobs.IsStopped(*updateSetupJob) {
+			klog.Infof("Found stopped update-setup job %s - starting controller to update Progressing condition", updateSetupJobName)
+			jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		klog.Warningf("Failed to check for update-setup job: %v", err)
+	}
+
+	return nil
 }
 
 // waitForEtcdBootstrapCompleted waits for etcd bootstrap to complete.
