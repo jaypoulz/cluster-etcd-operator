@@ -60,7 +60,8 @@ func waitWithConditionFunc(ctx context.Context, kubeClient kubernetes.Interface,
 	})
 }
 
-// DeleteAndWait deletes a job and waits until it disappears from the API
+// DeleteAndWait deletes a job and waits until it disappears from the API.
+// Uses Background propagation to automatically delete child pods.
 func DeleteAndWait(ctx context.Context, kubeClient kubernetes.Interface, jobName string, jobNamespace string) error {
 	klog.V(4).Infof("deleting oldJob %s", jobName)
 	oldJob, err := kubeClient.BatchV1().Jobs(jobNamespace).Get(ctx, jobName, v1.GetOptions{})
@@ -73,7 +74,11 @@ func DeleteAndWait(ctx context.Context, kubeClient kubernetes.Interface, jobName
 	}
 	oldJobUID := oldJob.GetUID()
 
-	err = kubeClient.BatchV1().Jobs(jobNamespace).Delete(ctx, jobName, v1.DeleteOptions{})
+	// Delete job with Background propagation to automatically clean up pods
+	propagationPolicy := v1.DeletePropagationBackground
+	err = kubeClient.BatchV1().Jobs(jobNamespace).Delete(ctx, jobName, v1.DeleteOptions{
+		PropagationPolicy: &propagationPolicy,
+	})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil

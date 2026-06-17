@@ -86,48 +86,6 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 					// Node-specific job: schedule on node and label with UID for cleanup
 					job.Spec.Template.Spec.NodeName = nodeTarget.Name
 					job.Labels["node"] = nodeTarget.UID
-				} else if jobType == tools.JobTypeUpdateSetup {
-					// Update-setup job: read target node from latest ConfigMap
-					cmList, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).List(context.Background(), v1.ListOptions{
-						LabelSelector: "app.kubernetes.io/component=" + tools.TnfUpdateSetupComponentValue,
-					})
-					if err != nil {
-						return fmt.Errorf("failed to list update-setup ConfigMaps: %w", err)
-					}
-
-					// Find ConfigMap with highest generation
-					var latestCM *v1.ObjectMeta
-					var latestCMData map[string]string
-					var maxGen int64 = -1
-					for i := range cmList.Items {
-						cm := &cmList.Items[i]
-						genStr := cm.Data["generation"]
-						if genStr == "" {
-							continue
-						}
-						var gen int64
-						if _, err := fmt.Sscanf(genStr, "%d", &gen); err != nil {
-							klog.Warningf("Invalid generation %q in ConfigMap %s: %v", genStr, cm.Name, err)
-							continue
-						}
-						if gen > maxGen {
-							maxGen = gen
-							latestCM = &cm.ObjectMeta
-							latestCMData = cm.Data
-						}
-					}
-
-					if latestCM == nil {
-						return fmt.Errorf("no valid update-setup ConfigMap found")
-					}
-
-					targetNodeName := latestCMData["targetNode"]
-					if targetNodeName == "" {
-						return fmt.Errorf("targetNode not found in ConfigMap %s", latestCM.Name)
-					}
-
-					klog.Infof("Scheduling update-setup job on node %s (from ConfigMap %s)", targetNodeName, latestCM.Name)
-					job.Spec.Template.Spec.NodeName = targetNodeName
 				} else if scheduleOnNode != nil {
 					// Cluster-wide job with scheduling hint
 					job.Spec.Template.Spec.NodeName = *scheduleOnNode

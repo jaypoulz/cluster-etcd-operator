@@ -1143,13 +1143,13 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 		expectUpdateSetupCalled bool
 	}{
 		{
-			name:               "no pacemaker CR - bootstrap reconciliation",
+			name:               "no pacemaker CR - discovery reconciliation",
 			transitionComplete: true, // Note: In production, sync() would not call this before transition
 			nodeInformerSynced: true,
 			k8sNodes: []*corev1.Node{
 				createReadyNodeWithIPLM("master-0", "192.168.1.10"),
 			},
-			// pacemakerNodes is nil - will trigger bootstrap reconciliation (try first node)
+			// pacemakerNodes is nil - will trigger discovery reconciliation (try all nodes)
 			expectError:             false,
 			expectUpdateSetupCalled: true,
 		},
