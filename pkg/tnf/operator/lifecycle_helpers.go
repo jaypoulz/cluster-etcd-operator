@@ -12,12 +12,14 @@ import (
 
 // getPacemakerNodes returns a map of node name -> IP from the PacemakerCluster CR.
 func (c *PacemakerLifecycleManager) getPacemakerNodes() (map[string]string, error) {
-	// Check if pacemaker informer has synced
-	if c.pacemakerInformer == nil || !c.pacemakerInformer.HasSynced() {
-		return nil, fmt.Errorf("pacemakerInformer not synced yet")
+	// Check if informer exists
+	if c.pacemakerInformer == nil {
+		return nil, fmt.Errorf("pacemakerInformer is nil")
 	}
 
 	// Get PacemakerCluster CR from informer cache
+	// Note: We don't check HasSynced() here because the watch stream sometimes fails with decode errors
+	// even though the cache is populated via List. The cache will be refreshed on resync interval.
 	item, exists, err := c.pacemakerInformer.GetStore().GetByKey(pacemaker.PacemakerClusterResourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get PacemakerCluster from cache: %w", err)
