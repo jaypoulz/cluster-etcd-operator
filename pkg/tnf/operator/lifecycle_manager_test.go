@@ -1231,7 +1231,7 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 			expectUpdateSetupCalled: true,
 		},
 		{
-			name:               "drift - update-setup already running - skip",
+			name:               "drift - update-setup already running - still reconcile",
 			transitionComplete: true,
 			nodeInformerSynced: true,
 			k8sNodes: []*corev1.Node{
@@ -1245,7 +1245,7 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 				createRunningUpdateSetupJobLM("tnf-update-setup-job"),
 			},
 			expectError:             false,
-			expectUpdateSetupCalled: false,
+			expectUpdateSetupCalled: true,
 		},
 		{
 			name:               "drift - no intersection - error",

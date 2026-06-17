@@ -97,10 +97,21 @@ func NewPacemakerLifecycleManager(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				klog.V(4).Infof("PacemakerCluster informer ListFunc called for resource %s", pacemaker.PacemakerResourceName)
+				// Sanitize ListOptions - remove fields not supported by all Kubernetes versions
+				sanitizedOptions := metav1.ListOptions{
+					LabelSelector:       options.LabelSelector,
+					FieldSelector:       options.FieldSelector,
+					Watch:               options.Watch,
+					AllowWatchBookmarks: options.AllowWatchBookmarks,
+					ResourceVersion:     options.ResourceVersion,
+					TimeoutSeconds:      options.TimeoutSeconds,
+					Limit:               options.Limit,
+					Continue:            options.Continue,
+				}
 				result := &pacmkrv1.PacemakerClusterList{}
 				err := restClient.Get().
 					Resource(pacemaker.PacemakerResourceName).
-					VersionedParams(&options, runtime.NewParameterCodec(scheme)).
+					VersionedParams(&sanitizedOptions, runtime.NewParameterCodec(scheme)).
 					Do(context.Background()).
 					Into(result)
 				if err != nil {
@@ -112,9 +123,21 @@ func NewPacemakerLifecycleManager(
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				klog.V(4).Infof("PacemakerCluster informer WatchFunc called for resource %s", pacemaker.PacemakerResourceName)
+				// Sanitize ListOptions - remove fields not supported by all Kubernetes versions
+				// sendInitialEvents and resourceVersionMatch were added in 1.27+ and cause errors on older clusters
+				sanitizedOptions := metav1.ListOptions{
+					LabelSelector:       options.LabelSelector,
+					FieldSelector:       options.FieldSelector,
+					Watch:               options.Watch,
+					AllowWatchBookmarks: options.AllowWatchBookmarks,
+					ResourceVersion:     options.ResourceVersion,
+					TimeoutSeconds:      options.TimeoutSeconds,
+					Limit:               options.Limit,
+					Continue:            options.Continue,
+				}
 				watcher, err := restClient.Get().
 					Resource(pacemaker.PacemakerResourceName).
-					VersionedParams(&options, runtime.NewParameterCodec(scheme)).
+					VersionedParams(&sanitizedOptions, runtime.NewParameterCodec(scheme)).
 					Watch(context.Background())
 				if err != nil {
 					klog.Errorf("Failed to watch PacemakerCluster resources (%s): %v", pacemaker.PacemakerResourceName, err)
