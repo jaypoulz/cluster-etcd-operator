@@ -133,17 +133,6 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	reconcilePacemakerConfigMutex.Lock()
 	defer reconcilePacemakerConfigMutex.Unlock()
 
-	// Check if update-setup is already running
-	isRunning, err := c.isUpdateSetupRunning(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to check if update-setup is running: %w", err)
-	}
-
-	if isRunning {
-		klog.V(2).Infof("Update-setup already running, skipping reconciliation trigger")
-		return nil
-	}
-
 	// Re-check drift and stopped job after acquiring lock (another goroutine may have changed state)
 	stoppedJob, err = c.getStoppedUpdateSetupJob(ctx)
 	if err != nil {
@@ -152,13 +141,13 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	hasDrift = c.detectDrift(k8sNodes, pacemakerNodes)
 
 	// Decision tree:
-	// 1. If drift exists → run updateSetup (creates ConfigMap + calls RestartJobOrRunController)
+	// 1. If drift exists → ensure ConfigMap exists and matches desired state, start controller if needed
 	// 2. If stopped unsuccessful job but NO drift → delete job (cluster is correct, stale failure)
 	// 3. Otherwise → nothing to do
 
 	if hasDrift {
-		klog.Infof("Drift detected - triggering update-setup reconciliation")
-		// Continue to existing updateSetup flow below...
+		klog.Infof("Drift detected - ensuring ConfigMap and controller")
+		// Continue to ConfigMap creation and controller start below...
 	} else if stoppedJob != nil && !jobs.IsComplete(*stoppedJob) {
 		// No drift, but stopped unsuccessful job exists - cluster is correct, just delete the stale job
 		klog.Infof("No drift detected, but stopped job %s exists - deleting stale job to clear conditions", stoppedJob.Name)
@@ -172,9 +161,6 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 		return nil
 	}
 
-	// Trigger update-setup reconciliation
-	klog.Infof("Triggering update-setup reconciliation to sync pacemaker with K8s state")
-
 	// Calculate intersection: nodes that exist in BOTH K8s and pacemaker
 	intersection := c.getIntersection(k8sNodes, pacemakerNodes)
 	if len(intersection) == 0 {
@@ -183,7 +169,7 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 
 	klog.Infof("Found %d nodes in intersection (K8s ∩ pacemaker): %v", len(intersection), getNodeNames(intersection))
 
-	// Call update-setup with intersection nodes (it will pick target and write ConfigMap)
+	// Call update-setup with intersection nodes (creates/updates ConfigMap and ensures controller is running)
 	// Use updateSetupFunc to allow mocking in tests
 	return updateSetupFunc(
 		intersection,
