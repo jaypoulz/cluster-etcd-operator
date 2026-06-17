@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -266,6 +267,7 @@ func (c *PacemakerLifecycleManager) detectDrift(k8sNodes []*corev1.Node, pacemak
 
 // getIntersection returns nodes that exist in BOTH K8s and pacemaker.
 // Used to determine valid target nodes for update-setup operations.
+// Returns nodes sorted by name for deterministic ordering.
 func (c *PacemakerLifecycleManager) getIntersection(k8sNodes []*corev1.Node, pacemakerNodes map[string]string) []*corev1.Node {
 	intersection := []*corev1.Node{}
 	for _, k8sNode := range k8sNodes {
@@ -273,6 +275,10 @@ func (c *PacemakerLifecycleManager) getIntersection(k8sNodes []*corev1.Node, pac
 			intersection = append(intersection, k8sNode)
 		}
 	}
+	// Sort by name for deterministic target selection
+	sort.Slice(intersection, func(i, j int) bool {
+		return intersection[i].Name < intersection[j].Name
+	})
 	return intersection
 }
 
@@ -289,38 +295,45 @@ func isPacemakerCRStale(cr *pacmkrv1.PacemakerCluster) bool {
 
 // selectBootstrapTargetNodes selects which nodes to try during bootstrap (when PacemakerCluster CR doesn't exist).
 // Strategy: Try nodes sequentially, excluding nodes where previous attempts failed.
-// - If no stopped job exists, try the first node
-// - If a stopped unsuccessful job exists, try the next node (excluding the failed node)
+// - If no stopped job exists, return all nodes sorted by name
+// - If a stopped unsuccessful job exists, exclude that node and return remaining sorted nodes
 // - Returns empty list if all nodes have been tried and failed
 func (c *PacemakerLifecycleManager) selectBootstrapTargetNodes(k8sNodes []*corev1.Node, stoppedJob *batchv1.Job) []*corev1.Node {
 	if len(k8sNodes) == 0 {
 		return []*corev1.Node{}
 	}
 
-	// If no stopped job, try the first node
+	// Sort nodes by name for deterministic ordering
+	sortedNodes := make([]*corev1.Node, len(k8sNodes))
+	copy(sortedNodes, k8sNodes)
+	sort.Slice(sortedNodes, func(i, j int) bool {
+		return sortedNodes[i].Name < sortedNodes[j].Name
+	})
+
+	// If no stopped job, return all nodes
 	if stoppedJob == nil {
-		klog.V(4).Infof("No previous job attempt - selecting first node: %s", k8sNodes[0].Name)
-		return k8sNodes
+		klog.V(4).Infof("No previous job attempt - will try all nodes starting with: %s", sortedNodes[0].Name)
+		return sortedNodes
 	}
 
 	// If stopped job succeeded, we're done (shouldn't reach here, but handle gracefully)
 	if jobs.IsComplete(*stoppedJob) {
-		klog.V(4).Infof("Previous job succeeded - selecting first node: %s", k8sNodes[0].Name)
-		return k8sNodes
+		klog.V(4).Infof("Previous job succeeded - will try all nodes starting with: %s", sortedNodes[0].Name)
+		return sortedNodes
 	}
 
 	// Stopped job failed - find which node it ran on and exclude it
 	failedNodeName := stoppedJob.Spec.Template.Spec.NodeName
 	if failedNodeName == "" {
-		klog.Warningf("Stopped job %s has no NodeName - cannot determine which node failed, trying first node", stoppedJob.Name)
-		return k8sNodes
+		klog.Warningf("Stopped job %s has no NodeName - cannot determine which node failed, will try all nodes", stoppedJob.Name)
+		return sortedNodes
 	}
 
-	klog.Infof("Previous job failed on node %s - selecting next node to try", failedNodeName)
+	klog.Infof("Previous job failed on node %s - excluding from valid targets", failedNodeName)
 
 	// Build list of nodes excluding the failed one
 	remainingNodes := []*corev1.Node{}
-	for _, node := range k8sNodes {
+	for _, node := range sortedNodes {
 		if node.Name != failedNodeName {
 			remainingNodes = append(remainingNodes, node)
 		}
@@ -331,7 +344,7 @@ func (c *PacemakerLifecycleManager) selectBootstrapTargetNodes(k8sNodes []*corev
 		return []*corev1.Node{}
 	}
 
-	klog.Infof("Will try node %s (excluded failed node %s)", remainingNodes[0].Name, failedNodeName)
+	klog.Infof("Will try %d remaining node(s) starting with: %s", len(remainingNodes), remainingNodes[0].Name)
 	return remainingNodes
 }
 
@@ -422,8 +435,8 @@ func (c *PacemakerLifecycleManager) initUpdateSetupGeneration(ctx context.Contex
 	return nil
 }
 
-// updateSetup writes a snapshot ConfigMap, runs auth on all nodes, update-setup on one target, then after-setup on all.
-// validTargetNodes: nodes that can run the update-setup job (intersection of K8s and pacemaker)
+// updateSetup writes a snapshot ConfigMap, runs auth on all nodes, tries update-setup on valid targets, then after-setup on all.
+// validTargetNodes: nodes that can run the update-setup job (sorted, will try each until one succeeds)
 // allK8sNodes: all K8s nodes for the ConfigMap snapshot
 // pacemakerNodes: current pacemaker membership (name -> IP) from PacemakerCluster CR
 func updateSetup(
@@ -437,17 +450,16 @@ func updateSetup(
 	kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
 ) error {
 
-	// Pick target node from valid nodes (first in list)
 	if len(validTargetNodes) == 0 {
 		return fmt.Errorf("no valid target nodes for update-setup - manual intervention may be required")
 	}
-	targetNode := validTargetNodes[0]
 
 	// Encode desired state for comparison
 	nodeListData, err := encodeNodeList(allK8sNodes)
 	if err != nil {
 		return fmt.Errorf("failed to encode node list: %w", err)
 	}
+	validTargetNodesData := encodeStringList(getNodeNames(validTargetNodes))
 
 	// Check if current generation matches desired state - if so, reuse it instead of creating new one
 	currentGeneration := getCurrentUpdateSetupGeneration()
@@ -459,7 +471,7 @@ func updateSetup(
 		currentCM, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Get(ctx, currentCMName, v1.GetOptions{})
 		if err == nil {
 			// Compare desired state with current ConfigMap
-			if currentCM.Data["nodes"] == nodeListData && currentCM.Data["targetNode"] == targetNode.Name {
+			if currentCM.Data["nodes"] == nodeListData && currentCM.Data["validTargetNodes"] == validTargetNodesData {
 				klog.Infof("Desired state matches current generation %d - reusing existing ConfigMap", currentGeneration)
 				generation = currentGeneration
 				shouldCreateNewConfigMap = false
@@ -480,18 +492,18 @@ func updateSetup(
 		shouldCreateNewConfigMap = true
 	}
 
-	klog.Infof("Generation %d: Target=%s, ValidTargets=%v, AllNodes=%v",
-		generation, targetNode.Name, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
+	klog.Infof("Generation %d: ValidTargets=%v, AllNodes=%v",
+		generation, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
 
 	cmName := fmt.Sprintf("tnf-update-setup-%d", generation)
 
 	// Only create ConfigMap if desired state differs from current generation
 	if shouldCreateNewConfigMap {
 		cmData := map[string]string{
-			"nodes":      nodeListData,    // Desired state: which K8s nodes should be in pacemaker
-			"targetNode": targetNode.Name, // Which node should run the update-setup job
-			"generation": fmt.Sprintf("%d", generation),
-			"timestamp":  time.Now().Format(time.RFC3339),
+			"nodes":            nodeListData,         // Desired state: which K8s nodes should be in pacemaker
+			"validTargetNodes": validTargetNodesData, // Which nodes can run the update-setup job (will try in order)
+			"generation":       fmt.Sprintf("%d", generation),
+			"timestamp":        time.Now().Format(time.RFC3339),
 		}
 		cm := &corev1.ConfigMap{
 			ObjectMeta: v1.ObjectMeta{
@@ -524,17 +536,35 @@ func updateSetup(
 		return err
 	}
 
-	// Run update-setup job on target node
-	// This is a cluster-wide operation (not tied to node lifecycle), but scheduled on a pacemaker-active node
+	// Try update-setup job on each valid target node until one succeeds
 	timeout := getJobTimeout(tools.JobTypeUpdateSetup)
-	if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, &targetNode.Name,
-		controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces,
-		jobs.DefaultConditions, timeout); err != nil {
-		return fmt.Errorf("failed to start update-setup job: %w", err)
+	var lastErr error
+	for _, targetNode := range validTargetNodes {
+		klog.Infof("Attempting update-setup on node %s", targetNode.Name)
+
+		if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, &targetNode.Name,
+			controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces,
+			jobs.DefaultConditions, timeout); err != nil {
+			lastErr = fmt.Errorf("failed to start update-setup job on %s: %w", targetNode.Name, err)
+			klog.Warningf("%v - trying next node if available", lastErr)
+			continue
+		}
+
+		if err := jobs.WaitForCompletion(ctx, kubeClient, tools.JobTypeUpdateSetup.GetJobName(nil),
+			operatorclient.TargetNamespace, timeout); err != nil {
+			lastErr = fmt.Errorf("update-setup job failed on %s: %w", targetNode.Name, err)
+			klog.Warningf("%v - trying next node if available", lastErr)
+			continue
+		}
+
+		// Success - job completed on this node
+		klog.Infof("Update-setup succeeded on node %s", targetNode.Name)
+		lastErr = nil
+		break
 	}
-	if err := jobs.WaitForCompletion(ctx, kubeClient, tools.JobTypeUpdateSetup.GetJobName(nil),
-		operatorclient.TargetNamespace, timeout); err != nil {
-		return fmt.Errorf("failed to wait for update-setup job: %w", err)
+
+	if lastErr != nil {
+		return fmt.Errorf("update-setup failed on all %d valid target nodes: %w", len(validTargetNodes), lastErr)
 	}
 
 	// Run after-setup jobs on all nodes for post-reconciliation tasks
@@ -606,22 +636,24 @@ func getJobTimeout(jobType tools.JobType) time.Duration {
 }
 
 // encodeNodeList encodes a list of nodes to JSON.
+// Only includes name and IP to avoid unnecessary ConfigMap recreation when labels/addresses change.
 func encodeNodeList(nodes []*corev1.Node) (string, error) {
 	type nodeInfo struct {
-		Name              string               `json:"name"`
-		CreationTimestamp v1.Time              `json:"creationTimestamp"`
-		Labels            map[string]string    `json:"labels"`
-		Addresses         []corev1.NodeAddress `json:"addresses"`
+		Name string `json:"name"`
+		IP   string `json:"ip"`
 	}
 
-	infos := make([]nodeInfo, len(nodes))
-	for i, node := range nodes {
-		infos[i] = nodeInfo{
-			Name:              node.Name,
-			CreationTimestamp: node.CreationTimestamp,
-			Labels:            node.Labels,
-			Addresses:         node.Status.Addresses,
+	infos := make([]nodeInfo, 0, len(nodes))
+	for _, node := range nodes {
+		ip, err := tools.GetNodeIPForPacemaker(*node)
+		if err != nil {
+			klog.Warningf("Failed to get IP for node %s: %v - skipping from ConfigMap", node.Name, err)
+			continue
 		}
+		infos = append(infos, nodeInfo{
+			Name: node.Name,
+			IP:   ip,
+		})
 	}
 
 	data, err := json.Marshal(infos)

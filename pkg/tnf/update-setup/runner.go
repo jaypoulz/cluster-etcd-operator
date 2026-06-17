@@ -502,10 +502,8 @@ func removeUnstartedEtcdMembers(ctx context.Context, currentNodeIPs map[string]s
 
 func decodeNodeList(data string) ([]*corev1.Node, error) {
 	type nodeInfo struct {
-		Name              string               `json:"name"`
-		CreationTimestamp metav1.Time          `json:"creationTimestamp"`
-		Labels            map[string]string    `json:"labels"`
-		Addresses         []corev1.NodeAddress `json:"addresses"`
+		Name string `json:"name"`
+		IP   string `json:"ip"`
 	}
 
 	var infos []nodeInfo
@@ -515,14 +513,18 @@ func decodeNodeList(data string) ([]*corev1.Node, error) {
 
 	nodes := make([]*corev1.Node, len(infos))
 	for i, info := range infos {
+		// Create minimal node with name and IP address
 		nodes[i] = &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:              info.Name,
-				CreationTimestamp: info.CreationTimestamp,
-				Labels:            info.Labels,
+				Name: info.Name,
 			},
 			Status: corev1.NodeStatus{
-				Addresses: info.Addresses,
+				Addresses: []corev1.NodeAddress{
+					{
+						Type:    corev1.NodeInternalIP,
+						Address: info.IP,
+					},
+				},
 			},
 		}
 	}
