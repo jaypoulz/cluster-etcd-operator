@@ -1143,15 +1143,15 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 		expectUpdateSetupCalled bool
 	}{
 		{
-			name:               "no pacemaker CR - skip",
+			name:               "no pacemaker CR - bootstrap reconciliation",
 			transitionComplete: true, // Note: In production, sync() would not call this before transition
 			nodeInformerSynced: true,
 			k8sNodes: []*corev1.Node{
 				createReadyNodeWithIPLM("master-0", "192.168.1.10"),
 			},
-			// pacemakerNodes is nil, so getPacemakerNodes() will return error and function will skip
+			// pacemakerNodes is nil - will trigger bootstrap reconciliation (try first node)
 			expectError:             false,
-			expectUpdateSetupCalled: false,
+			expectUpdateSetupCalled: true,
 		},
 		{
 			name:               "node informer not synced - skip",

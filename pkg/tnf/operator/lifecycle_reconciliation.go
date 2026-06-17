@@ -17,10 +17,17 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	pacmkrv1 "github.com/openshift/api/etcd/v1"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
+)
+
+const (
+	// pacemakerCRStalenessThreshold is how long before a PacemakerCluster CR status is considered stale.
+	// Status collector runs every minute, so 5 minutes means we've missed ~5 consecutive updates.
+	pacemakerCRStalenessThreshold = 5 * time.Minute
 )
 
 var (
@@ -82,11 +89,17 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	}
 
 	// Get pacemaker nodes from PacemakerCluster CR
-	pacemakerNodes, err := c.getPacemakerNodes()
-	if err != nil {
-		// CR might not exist yet during initial setup, don't treat as error
-		klog.V(4).Infof("Skipping reconciliation check - failed to get pacemaker nodes: %v", err)
-		return nil
+	pacemakerNodes, pacemakerCR, err := c.getPacemakerNodesWithCR()
+	pacemakerNodesAvailable := (err == nil)
+	if !pacemakerNodesAvailable {
+		klog.V(4).Infof("PacemakerCluster CR not available: %v - will attempt bootstrap reconciliation", err)
+	} else {
+		// Check if CR status is stale (not updated recently)
+		if isPacemakerCRStale(pacemakerCR) {
+			klog.Warningf("PacemakerCluster CR status is stale (last updated %v) - treating as unavailable for bootstrap reconciliation", pacemakerCR.Status.LastUpdated)
+			pacemakerNodesAvailable = false
+			pacemakerNodes = nil
+		}
 	}
 
 	// Check for stopped update-setup job from previous run (handles perma-degraded/perma-progressing)
@@ -98,7 +111,14 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	}
 
 	// Detect drift (compares node names and IPs)
-	hasDrift := c.detectDrift(k8sNodes, pacemakerNodes)
+	var hasDrift bool
+	if pacemakerNodesAvailable {
+		hasDrift = c.detectDrift(k8sNodes, pacemakerNodes)
+	} else {
+		// CR doesn't exist - treat as drift (unknown pacemaker state = needs reconciliation)
+		hasDrift = true
+		klog.Infof("PacemakerCluster CR not available - treating as drift for bootstrap reconciliation")
+	}
 
 	// Determine if we need to take action
 	needsReconciliation := false
@@ -161,18 +181,30 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 		return nil
 	}
 
-	// Calculate intersection: nodes that exist in BOTH K8s and pacemaker
-	intersection := c.getIntersection(k8sNodes, pacemakerNodes)
-	if len(intersection) == 0 {
-		return fmt.Errorf("no nodes in both K8s and pacemaker - manual intervention may be required")
+	// Calculate valid target nodes for update-setup job
+	var validTargetNodes []*corev1.Node
+	if pacemakerNodesAvailable {
+		// CR exists - use intersection: nodes that exist in BOTH K8s and pacemaker
+		intersection := c.getIntersection(k8sNodes, pacemakerNodes)
+		if len(intersection) == 0 {
+			return fmt.Errorf("no nodes in both K8s and pacemaker - manual intervention may be required")
+		}
+		validTargetNodes = intersection
+		klog.Infof("Found %d nodes in intersection (K8s ∩ pacemaker): %v", len(validTargetNodes), getNodeNames(validTargetNodes))
+	} else {
+		// CR doesn't exist (bootstrap case) - try nodes sequentially
+		// Use stopped job to determine which node we already tried (to avoid retrying same node)
+		validTargetNodes = c.selectBootstrapTargetNodes(k8sNodes, stoppedJob)
+		if len(validTargetNodes) == 0 {
+			return fmt.Errorf("no valid nodes for bootstrap - all nodes have been tried and failed")
+		}
+		klog.Infof("Bootstrap mode: will try node %s (from %d available nodes)", validTargetNodes[0].Name, len(k8sNodes))
 	}
 
-	klog.Infof("Found %d nodes in intersection (K8s ∩ pacemaker): %v", len(intersection), getNodeNames(intersection))
-
-	// Call update-setup with intersection nodes (creates/updates ConfigMap and ensures controller is running)
+	// Call update-setup with valid target nodes (creates/updates ConfigMap and ensures controller is running)
 	// Use updateSetupFunc to allow mocking in tests
 	return updateSetupFunc(
-		intersection,
+		validTargetNodes,
 		k8sNodes,
 		pacemakerNodes,
 		ctx,
@@ -242,6 +274,65 @@ func (c *PacemakerLifecycleManager) getIntersection(k8sNodes []*corev1.Node, pac
 		}
 	}
 	return intersection
+}
+
+// isPacemakerCRStale checks if the PacemakerCluster CR status is stale (hasn't been updated recently).
+// A stale CR indicates the status collector isn't running or pacemaker isn't responding.
+func isPacemakerCRStale(cr *pacmkrv1.PacemakerCluster) bool {
+	if cr == nil {
+		return true
+	}
+
+	timeSinceUpdate := time.Since(cr.Status.LastUpdated.Time)
+	return timeSinceUpdate > pacemakerCRStalenessThreshold
+}
+
+// selectBootstrapTargetNodes selects which nodes to try during bootstrap (when PacemakerCluster CR doesn't exist).
+// Strategy: Try nodes sequentially, excluding nodes where previous attempts failed.
+// - If no stopped job exists, try the first node
+// - If a stopped unsuccessful job exists, try the next node (excluding the failed node)
+// - Returns empty list if all nodes have been tried and failed
+func (c *PacemakerLifecycleManager) selectBootstrapTargetNodes(k8sNodes []*corev1.Node, stoppedJob *batchv1.Job) []*corev1.Node {
+	if len(k8sNodes) == 0 {
+		return []*corev1.Node{}
+	}
+
+	// If no stopped job, try the first node
+	if stoppedJob == nil {
+		klog.V(4).Infof("No previous job attempt - selecting first node: %s", k8sNodes[0].Name)
+		return k8sNodes
+	}
+
+	// If stopped job succeeded, we're done (shouldn't reach here, but handle gracefully)
+	if jobs.IsComplete(*stoppedJob) {
+		klog.V(4).Infof("Previous job succeeded - selecting first node: %s", k8sNodes[0].Name)
+		return k8sNodes
+	}
+
+	// Stopped job failed - find which node it ran on and exclude it
+	failedNodeName := stoppedJob.Spec.Template.Spec.NodeName
+	if failedNodeName == "" {
+		klog.Warningf("Stopped job %s has no NodeName - cannot determine which node failed, trying first node", stoppedJob.Name)
+		return k8sNodes
+	}
+
+	klog.Infof("Previous job failed on node %s - selecting next node to try", failedNodeName)
+
+	// Build list of nodes excluding the failed one
+	remainingNodes := []*corev1.Node{}
+	for _, node := range k8sNodes {
+		if node.Name != failedNodeName {
+			remainingNodes = append(remainingNodes, node)
+		}
+	}
+
+	if len(remainingNodes) == 0 {
+		klog.Warningf("All %d nodes have been tried - no remaining nodes to attempt", len(k8sNodes))
+		return []*corev1.Node{}
+	}
+
+	klog.Infof("Will try node %s (excluded failed node %s)", remainingNodes[0].Name, failedNodeName)
+	return remainingNodes
 }
 
 // isUpdateSetupRunning checks if any update-setup job is currently running.

@@ -12,9 +12,16 @@ import (
 
 // getPacemakerNodes returns a map of node name -> IP from the PacemakerCluster CR.
 func (c *PacemakerLifecycleManager) getPacemakerNodes() (map[string]string, error) {
+	nodes, _, err := c.getPacemakerNodesWithCR()
+	return nodes, err
+}
+
+// getPacemakerNodesWithCR returns both the node map and the full CR from the PacemakerCluster CR.
+// Returns (nodes, CR, error). Useful when caller needs to check CR metadata like LastUpdated.
+func (c *PacemakerLifecycleManager) getPacemakerNodesWithCR() (map[string]string, *pacmkrv1.PacemakerCluster, error) {
 	// Check if informer exists
 	if c.pacemakerInformer == nil {
-		return nil, fmt.Errorf("pacemakerInformer is nil")
+		return nil, nil, fmt.Errorf("pacemakerInformer is nil")
 	}
 
 	// Get PacemakerCluster CR from informer cache
@@ -22,19 +29,19 @@ func (c *PacemakerLifecycleManager) getPacemakerNodes() (map[string]string, erro
 	// even though the cache is populated via List. The cache will be refreshed on resync interval.
 	item, exists, err := c.pacemakerInformer.GetStore().GetByKey(pacemaker.PacemakerClusterResourceName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get PacemakerCluster from cache: %w", err)
+		return nil, nil, fmt.Errorf("failed to get PacemakerCluster from cache: %w", err)
 	}
 	if !exists {
-		return nil, fmt.Errorf("PacemakerCluster CR not found")
+		return nil, nil, fmt.Errorf("PacemakerCluster CR not found")
 	}
 
 	pacemakerCR, ok := item.(*pacmkrv1.PacemakerCluster)
 	if !ok {
-		return nil, fmt.Errorf("failed to convert to PacemakerCluster")
+		return nil, nil, fmt.Errorf("failed to convert to PacemakerCluster")
 	}
 
 	if pacemakerCR.Status.Nodes == nil {
-		return nil, fmt.Errorf("PacemakerCluster CR has no nodes in status")
+		return nil, pacemakerCR, fmt.Errorf("PacemakerCluster CR has no nodes in status")
 	}
 
 	// Build map of nodeName -> IP (use first address as primary)
@@ -47,7 +54,7 @@ func (c *PacemakerLifecycleManager) getPacemakerNodes() (map[string]string, erro
 		pmNodes[node.NodeName] = node.Addresses[0].Address
 	}
 
-	return pmNodes, nil
+	return pmNodes, pacemakerCR, nil
 }
 
 // getNodeNames extracts node names from a list of nodes.
