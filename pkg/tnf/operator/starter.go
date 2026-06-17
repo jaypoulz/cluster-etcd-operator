@@ -7,14 +7,12 @@ import (
 	"os"
 	"time"
 
-	operatorv1 "github.com/openshift/api/operator/v1"
 	configv1informers "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/staticresourcecontroller"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -32,11 +30,6 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
-)
-
-const (
-	// pacemakerStatusCollectorName is the name of the Pacemaker status collector CronJob
-	pacemakerStatusCollectorName = "pacemaker-status-collector"
 )
 
 // HandleDualReplicaClusters checks feature gate and control plane topology,
@@ -214,7 +207,7 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 		klog.Infof("PacemakerCluster CRD is established")
 
 		// Prerequisites met: create and start lifecycle manager controller.
-		lifecycleController, _, pacemakerInformer, err := NewPacemakerLifecycleManager(
+		lifecycleController, lifecycleManager, pacemakerInformer, err := NewPacemakerLifecycleManager(
 			operatorClient,
 			kubeClient,
 			controllerContext.EventRecorder,
@@ -239,53 +232,10 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 		go lifecycleController.Run(ctx, 1)
 
 		// Start the status collector CronJob.
-		runPacemakerStatusCollectorCronJob(ctx, controllerContext, operatorClient, kubeClient)
+		runPacemakerStatusCollectorCronJob(ctx, controllerContext, operatorClient, kubeClient, lifecycleManager, nodeInformer)
 
 		klog.Infof("started Pacemaker controllers (lifecycle manager, status collector)")
 	}()
-}
-
-func runPacemakerStatusCollectorCronJob(ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface) {
-	// Start the cronjob controller to create a CronJob for periodic status collection.
-	// The CronJob runs "tnf-monitor collect" which executes "sudo -n pcs status xml" and updates the PacemakerCluster CR.
-	statusCronJobController := jobs.NewCronJobController(
-		pacemakerStatusCollectorName,
-		bindata.MustAsset("tnfdeployment/cronjob.yaml"),
-		operatorClient,
-		kubeClient,
-		controllerContext.EventRecorder,
-		func(_ *operatorv1.OperatorSpec, cronJob *batchv1.CronJob) error {
-			// Set the name and namespace
-			cronJob.SetName(pacemakerStatusCollectorName)
-			cronJob.SetNamespace(operatorclient.TargetNamespace)
-
-			// Set the schedule - run every minute
-			cronJob.Spec.Schedule = "* * * * *"
-
-			// Initialize labels maps if nil and set labels at all levels
-			if cronJob.Labels == nil {
-				cronJob.Labels = make(map[string]string)
-			}
-			cronJob.Labels["app.kubernetes.io/name"] = pacemakerStatusCollectorName
-
-			if cronJob.Spec.JobTemplate.Labels == nil {
-				cronJob.Spec.JobTemplate.Labels = make(map[string]string)
-			}
-			cronJob.Spec.JobTemplate.Labels["app.kubernetes.io/name"] = pacemakerStatusCollectorName
-
-			if cronJob.Spec.JobTemplate.Spec.Template.Labels == nil {
-				cronJob.Spec.JobTemplate.Spec.Template.Labels = make(map[string]string)
-			}
-			cronJob.Spec.JobTemplate.Spec.Template.Labels["app.kubernetes.io/name"] = pacemakerStatusCollectorName
-
-			// Configure the container
-			cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Image = os.Getenv("OPERATOR_IMAGE")
-			cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Command = []string{"tnf-monitor", "collect", "-v=4"}
-
-			return nil
-		},
-	)
-	go statusCronJobController.Run(ctx, 1)
 }
 
 func handleFencingSecretChange(
