@@ -86,7 +86,7 @@ func runCollector() error {
 	}
 
 	// Cluster config provides authoritative node list with IPs
-	clusterConfig, err := fetchClusterConfig(ctx)
+	clusterConfig, err := FetchClusterConfig(ctx)
 	if err != nil {
 		klog.Warningf("Failed to fetch cluster config: %v (continuing with limited node data)", err)
 	}
@@ -124,7 +124,9 @@ func createKubeClient() (kubernetes.Interface, error) {
 }
 
 // fetchClusterConfig returns the authoritative node list with IP addresses.
-func fetchClusterConfig(ctx context.Context) (*ClusterConfig, error) {
+// FetchClusterConfig queries pacemaker for the cluster configuration and returns the parsed result.
+// This is exported so it can be shared by both the status collector and update-setup runner.
+func FetchClusterConfig(ctx context.Context) (*ClusterConfig, error) {
 	ctxExec, cancel := context.WithTimeout(ctx, execTimeout)
 	defer cancel()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-etcd-operator/bindata"
@@ -113,8 +114,9 @@ func runPacemakerStatusCollectorCronJob(
 
 // selectStatusCollectorTargetNode selects a target node for the status collector CronJob.
 // Strategy:
-// 1. If PacemakerCluster CR exists and is fresh, use intersection logic (K8s ∩ pacemaker)
-// 2. Otherwise, use deterministic pseudo-random selection based on CronJob run count
+// 1. If PacemakerCluster CR exists, use intersection logic (K8s ∩ pacemaker)
+// 2. Otherwise, check for recent failed Jobs and try the other node
+// 3. Default to first ready node
 func selectStatusCollectorTargetNode(
 	k8sNodes []*corev1.Node,
 	kubeClient kubernetes.Interface,
@@ -136,7 +138,7 @@ func selectStatusCollectorTargetNode(
 		return "", fmt.Errorf("no ready control plane nodes found")
 	}
 
-	// Try to get pacemaker nodes from CR (if CR exists and is fresh)
+	// Try to get pacemaker nodes from CR
 	pacemakerNodes, err := lifecycleManager.getPacemakerNodes()
 	if err == nil {
 		// CR exists - use intersection logic
@@ -153,28 +155,39 @@ func selectStatusCollectorTargetNode(
 			klog.V(4).Infof("Scheduling status collector on intersection node: %s (from %d candidate nodes)", targetNode, len(intersection))
 			return targetNode, nil
 		}
-		// No intersection - fall through to random selection
-		klog.Warningf("No nodes in intersection (K8s ∩ pacemaker) - using deterministic selection")
+		// No intersection - fall through to failure-based selection
+		klog.Warningf("No nodes in intersection (K8s ∩ pacemaker) - checking for failed Jobs")
 	}
 
-	// CR doesn't exist or no intersection - use deterministic pseudo-random selection
-	// Count existing Jobs created by the CronJob to get run count
-	runCount, err := getStatusCollectorRunCount(kubeClient)
+	// CR doesn't exist or no intersection - check if we have a recent failed Job
+	// and try the other node if so
+	failedJobNode, err := getRecentFailedJobNode(kubeClient)
 	if err != nil {
-		klog.Warningf("Failed to get run count: %v - defaulting to first node", err)
+		klog.V(4).Infof("Failed to check for recent failed Jobs: %v - defaulting to first node", err)
 		return readyNodes[0].Name, nil
 	}
 
-	// Use modulo to select node deterministically (alternates between nodes)
-	nodeIndex := runCount % len(readyNodes)
-	targetNode := readyNodes[nodeIndex].Name
-	klog.Infof("Scheduling status collector on node %s (run count %d, index %d of %d nodes)", targetNode, runCount, nodeIndex, len(readyNodes))
+	if failedJobNode != "" {
+		// We have a recent failure - try a different node
+		for _, node := range readyNodes {
+			if node.Name != failedJobNode {
+				klog.Infof("Recent Job failed on %s - trying node %s instead", failedJobNode, node.Name)
+				return node.Name, nil
+			}
+		}
+		klog.Warningf("Recent Job failed on %s but no other ready nodes available", failedJobNode)
+	}
+
+	// No recent failures or couldn't determine - use first ready node
+	targetNode := readyNodes[0].Name
+	klog.V(4).Infof("Scheduling status collector on first ready node: %s", targetNode)
 	return targetNode, nil
 }
 
-// getStatusCollectorRunCount returns the number of times the status collector has run
-// by counting Jobs created by the CronJob (both active and completed).
-func getStatusCollectorRunCount(kubeClient kubernetes.Interface) (int, error) {
+// getRecentFailedJobNode returns the node name where a recent failed status collector Job ran.
+// Returns empty string if no recent failed Job exists.
+// "Recent" means failed Jobs from the last 5 minutes to avoid switching back and forth too quickly.
+func getRecentFailedJobNode(kubeClient kubernetes.Interface) (string, error) {
 	jobList, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).List(
 		context.Background(),
 		metav1.ListOptions{
@@ -182,8 +195,37 @@ func getStatusCollectorRunCount(kubeClient kubernetes.Interface) (int, error) {
 		},
 	)
 	if err != nil {
-		return 0, fmt.Errorf("failed to list status collector Jobs: %w", err)
+		return "", fmt.Errorf("failed to list status collector Jobs: %w", err)
 	}
 
-	return len(jobList.Items), nil
+	// Look for failed Jobs in the last 5 minutes
+	recentFailureThreshold := time.Now().Add(-5 * time.Minute)
+
+	for i := range jobList.Items {
+		job := &jobList.Items[i]
+
+		// Check if Job failed
+		failed := false
+		for _, condition := range job.Status.Conditions {
+			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+				failed = true
+				break
+			}
+		}
+
+		if !failed {
+			continue
+		}
+
+		// Check if failure is recent
+		if job.Status.CompletionTime != nil && job.Status.CompletionTime.Time.After(recentFailureThreshold) {
+			nodeName := job.Spec.Template.Spec.NodeName
+			if nodeName != "" {
+				klog.V(4).Infof("Found recent failed Job %s on node %s (failed at %v)", job.Name, nodeName, job.Status.CompletionTime)
+				return nodeName, nil
+			}
+		}
+	}
+
+	return "", nil
 }

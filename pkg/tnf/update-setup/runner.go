@@ -27,6 +27,7 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/config"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/etcd"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/exec"
+	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pacemaker"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pcs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
 	"github.com/openshift/library-go/pkg/operator/genericoperatorclient"
@@ -571,35 +572,10 @@ func buildClusterConfigFromNodeList(nodes []*corev1.Node) (config.ClusterConfig,
 // getCurrentPacemakerNodesWithIPs queries pacemaker directly to get current membership with IPs.
 // Returns a map of node names to IPs.
 func getCurrentPacemakerNodesWithIPs(ctx context.Context) (map[string]string, error) {
-	// Get cluster configuration from pacemaker as JSON (more reliable than parsing corosync.conf)
-	command := "/usr/sbin/pcs cluster config show --output-format json"
-	stdOut, stdErr, err := exec.Execute(ctx, command)
+	// Use shared fetchClusterConfig from pacemaker package
+	config, err := pacemaker.FetchClusterConfig(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get cluster config: stdout=%s, stderr=%s, err=%w", stdOut, stdErr, err)
-	}
-
-	// Parse JSON output using same types as status collector
-	type ClusterConfigNodeAddr struct {
-		Addr string `json:"addr"`
-		Link string `json:"link"`
-		Type string `json:"type"` // "IPv4", "IPv6"
-	}
-
-	type ClusterConfigNode struct {
-		Name   string                  `json:"name"`
-		NodeID string                  `json:"nodeid"`
-		Addrs  []ClusterConfigNodeAddr `json:"addrs"`
-	}
-
-	type ClusterConfig struct {
-		ClusterName string              `json:"cluster_name"`
-		ClusterUUID string              `json:"cluster_uuid"`
-		Nodes       []ClusterConfigNode `json:"nodes"`
-	}
-
-	var config ClusterConfig
-	if err := json.Unmarshal([]byte(stdOut), &config); err != nil {
-		return nil, fmt.Errorf("failed to parse cluster config JSON: %w", err)
+		return nil, fmt.Errorf("failed to fetch cluster config: %w", err)
 	}
 
 	nodeMap := make(map[string]string)
