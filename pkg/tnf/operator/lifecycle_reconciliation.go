@@ -566,9 +566,6 @@ func updateSetup(
 	return nil
 }
 
-// runJobsOnNodes runs a node-specific job type on the given nodes and waits for completion.
-// This is used for auth and after-setup jobs that are tied to individual node lifecycles.
-
 // getJobTimeout returns the appropriate timeout for a given job type.
 func getJobTimeout(jobType tools.JobType) time.Duration {
 	switch jobType {

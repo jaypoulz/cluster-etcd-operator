@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -182,12 +183,12 @@ func (c *PacemakerLifecycleManager) cleanupOldFinishedJobs(ctx context.Context) 
 }
 
 // getJobFinishTime returns the completion or failure time of a job
-func getJobFinishTime(job *batchv1.Job) metav1.Time {
+func getJobFinishTime(job *batchv1.Job) time.Time {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed {
-			return condition.LastTransitionTime
+			return condition.LastTransitionTime.Time
 		}
 	}
 	// Fallback to creation time if no completion condition found
-	return job.CreationTimestamp
+	return job.CreationTimestamp.Time
 }
