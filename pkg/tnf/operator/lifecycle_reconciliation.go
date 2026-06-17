@@ -305,6 +305,10 @@ func getNextUpdateSetupGeneration() int64 {
 	return updateSetupGeneration
 }
 
+func getCurrentUpdateSetupGeneration() int64 {
+	return updateSetupGeneration
+}
+
 // initUpdateSetupGeneration scans existing update-setup ConfigMaps and initializes the generation
 // counter to max(existing)+1 to prevent reusing stale ConfigMaps after operator restart.
 // Must be called once during lifecycle manager initialization before any reconciliation loops run.
@@ -356,46 +360,79 @@ func updateSetup(
 	kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
 ) error {
 
-	generation := getNextUpdateSetupGeneration()
-
 	// Pick target node from valid nodes (first in list)
 	if len(validTargetNodes) == 0 {
 		return fmt.Errorf("no valid target nodes for update-setup - manual intervention may be required")
 	}
 	targetNode := validTargetNodes[0]
 
-	klog.Infof("Generation %d: Target=%s, ValidTargets=%v, AllNodes=%v",
-		generation, targetNode.Name, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
-
-	// Snapshot K8s nodes (desired state) into ConfigMap for the runner
-	// Note: Old ConfigMaps are kept as historical record (deleted via defer after job completion)
-	// The runner will query current pacemaker state and calculate what needs to change
+	// Encode desired state for comparison
 	nodeListData, err := encodeNodeList(allK8sNodes)
 	if err != nil {
 		return fmt.Errorf("failed to encode node list: %w", err)
 	}
 
-	cmName := fmt.Sprintf("tnf-update-setup-%d", generation)
-	cmData := map[string]string{
-		"nodes":      nodeListData, // Desired state: which K8s nodes should be in pacemaker
-		"generation": fmt.Sprintf("%d", generation),
-		"timestamp":  time.Now().Format(time.RFC3339),
-	}
-	cm := &corev1.ConfigMap{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      cmName,
-			Namespace: operatorclient.TargetNamespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/component":      tools.TnfUpdateSetupComponentValue,
-				"tnf.etcd.openshift.io/generation": fmt.Sprintf("%d", generation),
-			},
-		},
-		Data: cmData,
+	// Check if current generation matches desired state - if so, reuse it instead of creating new one
+	currentGeneration := getCurrentUpdateSetupGeneration()
+	var generation int64
+	var shouldCreateNewConfigMap bool
+
+	if currentGeneration > 0 {
+		currentCMName := fmt.Sprintf("tnf-update-setup-%d", currentGeneration)
+		currentCM, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Get(ctx, currentCMName, v1.GetOptions{})
+		if err == nil {
+			// Compare desired state with current ConfigMap
+			if currentCM.Data["nodes"] == nodeListData && currentCM.Data["targetNode"] == targetNode.Name {
+				klog.Infof("Desired state matches current generation %d - reusing existing ConfigMap", currentGeneration)
+				generation = currentGeneration
+				shouldCreateNewConfigMap = false
+			} else {
+				klog.Infof("Desired state differs from generation %d - creating new generation", currentGeneration)
+				generation = getNextUpdateSetupGeneration()
+				shouldCreateNewConfigMap = true
+			}
+		} else {
+			// Current ConfigMap doesn't exist (deleted or error) - create new
+			klog.V(2).Infof("Current generation %d ConfigMap not found: %v - creating new generation", currentGeneration, err)
+			generation = getNextUpdateSetupGeneration()
+			shouldCreateNewConfigMap = true
+		}
+	} else {
+		// First generation
+		generation = getNextUpdateSetupGeneration()
+		shouldCreateNewConfigMap = true
 	}
 
-	_, err = kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Create(ctx, cm, v1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to create ConfigMap %s: %w", cmName, err)
+	klog.Infof("Generation %d: Target=%s, ValidTargets=%v, AllNodes=%v",
+		generation, targetNode.Name, getNodeNames(validTargetNodes), getNodeNames(allK8sNodes))
+
+	cmName := fmt.Sprintf("tnf-update-setup-%d", generation)
+
+	// Only create ConfigMap if desired state differs from current generation
+	if shouldCreateNewConfigMap {
+		cmData := map[string]string{
+			"nodes":      nodeListData,    // Desired state: which K8s nodes should be in pacemaker
+			"targetNode": targetNode.Name, // Which node should run the update-setup job
+			"generation": fmt.Sprintf("%d", generation),
+			"timestamp":  time.Now().Format(time.RFC3339),
+		}
+		cm := &corev1.ConfigMap{
+			ObjectMeta: v1.ObjectMeta{
+				Name:      cmName,
+				Namespace: operatorclient.TargetNamespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/component":      tools.TnfUpdateSetupComponentValue,
+					"tnf.etcd.openshift.io/generation": fmt.Sprintf("%d", generation),
+				},
+			},
+			Data: cmData,
+		}
+
+		_, err = kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Create(ctx, cm, v1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to create ConfigMap %s: %w", cmName, err)
+		}
+		klog.Infof("Created new ConfigMap %s for generation %d", cmName, generation)
 	}
 
 	// Clean up ConfigMap after all jobs complete
