@@ -131,21 +131,33 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedPods(ctx context.Context) err
 		existingJobs[job.Name] = true
 	}
 
-	// Delete pods whose owner Job no longer exists
+	// Delete pods whose owner Job no longer exists OR pods with no owner in terminal state
 	deletedCount := 0
 	var errs []error
 	for _, pod := range podList.Items {
-		// Check if pod has ownerReferences
-		if len(pod.OwnerReferences) == 0 {
-			klog.V(4).Infof("Pod %s has no owner references, skipping", pod.Name)
-			continue
+		shouldDelete := false
+		var reason string
+
+		// Case 1: Pod has owner reference but owner Job no longer exists
+		if len(pod.OwnerReferences) > 0 {
+			ownerJob := pod.OwnerReferences[0].Name
+			if !existingJobs[ownerJob] {
+				shouldDelete = true
+				reason = fmt.Sprintf("owner job %s no longer exists", ownerJob)
+			}
+		} else {
+			// Case 2: Pod has NO owner reference and is in terminal state (Succeeded/Failed)
+			// These are orphaned pods from deleted Jobs that didn't clean up properly
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				shouldDelete = true
+				reason = "no owner reference and pod in terminal state"
+			} else {
+				klog.V(4).Infof("Pod %s has no owner references but is not in terminal state (%s), skipping", pod.Name, pod.Status.Phase)
+			}
 		}
 
-		// Check if owner Job still exists
-		ownerJob := pod.OwnerReferences[0].Name
-		if !existingJobs[ownerJob] {
-			// Owner Job doesn't exist - delete orphaned pod
-			klog.V(2).Infof("Deleting orphaned TNF pod %s (owner job %s no longer exists)", pod.Name, ownerJob)
+		if shouldDelete {
+			klog.V(2).Infof("Deleting orphaned TNF pod %s (%s)", pod.Name, reason)
 
 			err := c.kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 			if err != nil && !apierrors.IsNotFound(err) {
