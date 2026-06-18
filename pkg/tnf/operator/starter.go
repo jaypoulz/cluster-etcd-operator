@@ -3,8 +3,10 @@ package operator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	configv1informers "github.com/openshift/client-go/config/informers/externalversions/config/v1"
@@ -81,10 +83,10 @@ func HandleDualReplicaClusters(
 	klog.Infof("watching for secrets...")
 	_, err = kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().Secrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
-			go handleFencingSecretChange(ctx, nil, obj, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
+			go handleFencingSecretChange(ctx, nil, obj, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, controlPlaneNodeInformer)
 		},
 		UpdateFunc: func(oldObj, newObj any) {
-			go handleFencingSecretChange(ctx, oldObj, newObj, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
+			go handleFencingSecretChange(ctx, oldObj, newObj, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, controlPlaneNodeInformer)
 		},
 		DeleteFunc: func(obj any) {
 			// nothing to do
@@ -244,6 +246,47 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 	}()
 }
 
+// createFencingJobConfigFunc creates a JobConfigFunc for the fencing job.
+// Returns a function that captures node UIDs and fencing secret UIDs for drift detection.
+func createFencingJobConfigFunc(nodeList []*corev1.Node, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
+	return func() (string, error) {
+		// Collect node UIDs
+		nodeUIDs := make([]string, len(nodeList))
+		for i, node := range nodeList {
+			nodeUIDs[i] = string(node.UID)
+		}
+		sort.Strings(nodeUIDs)
+
+		// Collect fencing secret UIDs from informer
+		secretsLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().Secrets().Lister()
+		allSecrets, err := secretsLister.Secrets(operatorclient.TargetNamespace).List(metav1.ListOptions{}.LabelSelector)
+		if err != nil {
+			return "", fmt.Errorf("failed to list secrets: %w", err)
+		}
+
+		var secretUIDs []string
+		for _, secret := range allSecrets {
+			if tools.IsFencingSecret(secret.Name) {
+				secretUIDs = append(secretUIDs, string(secret.UID))
+			}
+		}
+		sort.Strings(secretUIDs)
+
+		// Create config map with both node and secret UIDs
+		config := map[string]interface{}{
+			"nodeUIDs":   nodeUIDs,
+			"secretUIDs": secretUIDs,
+		}
+
+		configJSON, err := json.Marshal(config)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal fencing config: %w", err)
+		}
+
+		return string(configJSON), nil
+	}
+}
+
 func handleFencingSecretChange(
 	ctx context.Context,
 	oldObj, obj any,
@@ -251,6 +294,7 @@ func handleFencingSecretChange(
 	operatorClient v1helpers.StaticPodOperatorClient,
 	kubeClient kubernetes.Interface,
 	kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
+	nodeInformer cache.SharedIndexInformer,
 ) {
 
 	// obj can be nil, always restart fencing job in that case
@@ -304,9 +348,18 @@ func handleFencingSecretChange(
 		return
 	}
 
-	// Fencing job: no specific targeting, retries=3 sets backoffLimit
-	// TODO: Implement jobConfigFunc for fencing to capture node UIDs + secret UIDs
-	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
+	// Get control plane nodes for jobConfigFunc
+	nodes, err := ceohelpers.ListNodesFromInformer(nodeInformer)
+	if err != nil {
+		klog.Errorf("failed to list control plane nodes for fencing job config: %v", err)
+		return
+	}
+
+	// Create jobConfigFunc to capture node UIDs + fencing secret UIDs for drift detection
+	fencingJobConfigFunc := createFencingJobConfigFunc(nodes, kubeInformersForNamespaces)
+
+	// Restart fencing job with drift detection
+	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, fencingJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
 	if err != nil {
 		klog.Errorf("failed to restart fencing job: %v", err)
 		return

@@ -2,7 +2,9 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -237,7 +239,10 @@ func startTnfJobcontrollers(
 	// Cluster-wide jobs: setup and fencing can run on any node
 	// No specific targeting: retries=3 sets backoffLimit
 	jobs.RunTNFJobController(ctx, tools.JobTypeSetup, nil, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
-	jobs.RunTNFJobController(ctx, tools.JobTypeFencing, nil, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+
+	// Fencing job with drift detection: captures node UIDs + fencing secret UIDs
+	fencingJobConfigFunc := createFencingJobConfigFunc(nodeList, kubeInformersForNamespaces)
+	jobs.RunTNFJobController(ctx, tools.JobTypeFencing, nil, nil, fencingJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 	// wait until the after-setup jobs finished,
 	// in order to avoid races with update jobs
@@ -282,6 +287,47 @@ func waitForEtcdBootstrapCompleted(ctx context.Context, operatorClient v1helpers
 		}
 	}
 	return nil
+}
+
+// createFencingJobConfigFunc creates a JobConfigFunc for the fencing job.
+// Returns a function that captures node UIDs and fencing secret UIDs for drift detection.
+func createFencingJobConfigFunc(nodeList []*corev1.Node, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
+	return func() (string, error) {
+		// Collect node UIDs
+		nodeUIDs := make([]string, len(nodeList))
+		for i, node := range nodeList {
+			nodeUIDs[i] = string(node.UID)
+		}
+		sort.Strings(nodeUIDs)
+
+		// Collect fencing secret UIDs from informer
+		secretsLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().Secrets().Lister()
+		allSecrets, err := secretsLister.List(labels.Everything())
+		if err != nil {
+			return "", fmt.Errorf("failed to list secrets: %w", err)
+		}
+
+		var secretUIDs []string
+		for _, secret := range allSecrets {
+			if tools.IsFencingSecret(secret.Name) {
+				secretUIDs = append(secretUIDs, string(secret.UID))
+			}
+		}
+		sort.Strings(secretUIDs)
+
+		// Create config map with both node and secret UIDs
+		config := map[string]interface{}{
+			"nodeUIDs":   nodeUIDs,
+			"secretUIDs": secretUIDs,
+		}
+
+		configJSON, err := json.Marshal(config)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal fencing config: %w", err)
+		}
+
+		return string(configJSON), nil
+	}
 }
 
 // waitForTnfAfterSetupJobsCompletion waits for all after-setup jobs to complete.
