@@ -315,24 +315,25 @@ func (c *PacemakerLifecycleManager) sync(ctx context.Context, syncCtx factory.Sy
 		errs = append(errs, fmt.Errorf("failed to start job controllers: %w", err))
 	}
 
-	// Operations 2-4 only run after external etcd transition completes
+	// 2. Cleanup orphaned and old jobs (always runs, even before transition)
+	// This prevents job/pod accumulation during bootstrap or unhealthy states
+	if err := c.CleanupOrphanedJobs(ctx); err != nil {
+		klog.Errorf("Failed to cleanup orphaned jobs: %v", err)
+		errs = append(errs, fmt.Errorf("failed to cleanup orphaned jobs: %w", err))
+	}
+
+	// Operations 3-4 only run after external etcd transition completes
 	if transitionComplete {
-		// 2. Monitor pacemaker health
+		// 3. Monitor pacemaker health
 		if err := c.MonitorHealth(ctx); err != nil {
 			klog.Errorf("Failed to monitor health: %v", err)
 			errs = append(errs, fmt.Errorf("failed to monitor health: %w", err))
 		}
 
-		// 3. Reconcile pacemaker configuration (drift detection)
+		// 4. Reconcile pacemaker configuration (drift detection)
 		if err := c.ReconcilePacemakerConfig(ctx); err != nil {
 			klog.Errorf("Failed to reconcile pacemaker config: %v", err)
 			errs = append(errs, fmt.Errorf("failed to reconcile pacemaker config: %w", err))
-		}
-
-		// 4. Cleanup orphaned jobs
-		if err := c.CleanupOrphanedJobs(ctx); err != nil {
-			klog.Errorf("Failed to cleanup orphaned jobs: %v", err)
-			errs = append(errs, fmt.Errorf("failed to cleanup orphaned jobs: %w", err))
 		}
 	}
 

@@ -228,14 +228,16 @@ func startTnfJobcontrollers(
 	// the order of job creation does not matter, the jobs wait on each other as needed
 	for _, node := range nodeList {
 		// Node-specific jobs: auth and after-setup are tied to individual nodes
+		// Single-node: retries=3 sets backoffLimit (Kubernetes retries on same node)
 		nodeTarget := &jobs.NodeTarget{Name: node.Name, UID: string(node.UID)}
-		jobs.RunTNFJobController(ctx, tools.JobTypeAuth, nodeTarget, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
-		jobs.RunTNFJobController(ctx, tools.JobTypeAfterSetup, nodeTarget, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		jobs.RunTNFJobController(ctx, tools.JobTypeAuth, nodeTarget, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		jobs.RunTNFJobController(ctx, tools.JobTypeAfterSetup, nodeTarget, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 	}
 
 	// Cluster-wide jobs: setup and fencing can run on any node
-	jobs.RunTNFJobController(ctx, tools.JobTypeSetup, nil, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
-	jobs.RunTNFJobController(ctx, tools.JobTypeFencing, nil, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+	// No specific targeting: retries=3 sets backoffLimit
+	jobs.RunTNFJobController(ctx, tools.JobTypeSetup, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
+	jobs.RunTNFJobController(ctx, tools.JobTypeFencing, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 	// wait until the after-setup jobs finished,
 	// in order to avoid races with update jobs
@@ -251,7 +253,8 @@ func startTnfJobcontrollers(
 		// Job exists - check if it's stopped (completed or failed)
 		if jobs.IsStopped(*updateSetupJob) {
 			klog.Infof("Found stopped update-setup job %s - starting controller to update Progressing condition", updateSetupJobName)
-			jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+			// No validNodeFunc here - just starting controller to update conditions for existing stopped job
+			jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, nil, 0, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		klog.Warningf("Failed to check for update-setup job: %v", err)

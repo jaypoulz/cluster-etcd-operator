@@ -12,10 +12,12 @@ import (
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	"github.com/openshift/cluster-etcd-operator/bindata"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
@@ -29,6 +31,10 @@ type NodeTarget struct {
 	UID  string // Node UID for job labeling (enables cleanup on node deletion/replacement)
 }
 
+// ValidNodeFunc calculates the list of valid target nodes for a job.
+// Called by job controller before each attempt to get fresh node state.
+type ValidNodeFunc func() ([]*corev1.Node, error)
+
 var (
 	// runningControllers tracks which controllers are already running to prevent duplicates
 	runningControllers = make(map[string]bool)
@@ -39,7 +45,111 @@ var (
 	restartJobLocks = make(map[string]*sync.Mutex)
 	// restartJobLocksMutex protects the restartJobLocks map
 	restartJobLocksMutex sync.Mutex
+
+	// retryState tracks multi-node retry state for jobs using ValidNodeFunc
+	// Map key is job name, value tracks current attempt and node index
+	// No mutex needed: each job has only one controller (enforced by runningControllers)
+	retryState = make(map[string]*JobRetryState)
 )
+
+// JobRetryState tracks retry progress for multi-node jobs
+type JobRetryState struct {
+	AttemptNumber    int       // Current attempt (1-N)
+	NodeIndex        int       // Index of node to try in current attempt
+	ValidNodes       []string  // Cached node names from last validNodeFunc call
+	MaxRetryAttempts int       // Maximum attempts before degrading
+	LastFailTime     time.Time // When last failure occurred
+}
+
+// configureMultiNodeJob handles multi-node retry logic for cluster-wide jobs.
+// Uses validNodeFunc to get current valid nodes, tracks retry state, and selects
+// which node to schedule the job on based on previous failures.
+func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc ValidNodeFunc, maxRetryAttempts int) error {
+	jobName := job.Name
+
+	// Note: This function is called from the job hook during ApplyJob, which happens
+	// when the job doesn't exist OR when the spec needs updating. The generic JobController
+	// deletes failed jobs, triggering this hook on the next sync to create a fresh job.
+	// At that point, we need to decide which node to try next.
+
+	// Get current valid nodes from function
+	validNodes, err := validNodeFunc()
+	if err != nil {
+		return fmt.Errorf("failed to get valid nodes: %w", err)
+	}
+	if len(validNodes) == 0 {
+		return fmt.Errorf("no valid nodes available for job")
+	}
+
+	// Get or create retry state for this job
+	state, exists := retryState[jobName]
+	if !exists {
+		// First attempt - initialize state
+		state = &JobRetryState{
+			AttemptNumber:    1,
+			NodeIndex:        0,
+			ValidNodes:       getNodeNames(validNodes),
+			MaxRetryAttempts: maxRetryAttempts,
+		}
+		retryState[jobName] = state
+		klog.Infof("Starting job %s - attempt %d/%d, will try nodes: %v",
+			jobName, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
+	} else {
+		// Existing state - this means we're being called after a previous job
+		// The JobController deletes failed jobs, so if we're here, the previous job failed
+		// and was deleted. Increment to next node.
+		state.NodeIndex++
+		klog.V(2).Infof("Job %s retry - moving to next node (index %d)", jobName, state.NodeIndex)
+	}
+
+	// Select node to try
+	if state.NodeIndex >= len(validNodes) {
+		// Exhausted all nodes in this attempt
+		if state.AttemptNumber >= state.MaxRetryAttempts {
+			// Exceeded max attempts - reset to attempt 1 and continue trying
+			// Controller will be marked degraded but keep retrying
+			klog.Warningf("Job %s exhausted all %d attempts (tried %d nodes each), resetting to attempt 1 and continuing",
+				jobName, state.MaxRetryAttempts, len(validNodes))
+			state.AttemptNumber = 1
+			state.NodeIndex = 0
+			state.ValidNodes = getNodeNames(validNodes)
+		} else {
+			// Start new attempt
+			state.AttemptNumber++
+			state.NodeIndex = 0
+			state.ValidNodes = getNodeNames(validNodes)
+			klog.Infof("Job %s exhausted all nodes in attempt %d, starting attempt %d/%d with nodes: %v",
+				jobName, state.AttemptNumber-1, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
+		}
+	}
+
+	selectedNode := validNodes[state.NodeIndex]
+	klog.Infof("Job %s attempt %d/%d: scheduling on node %s (index %d/%d)",
+		jobName, state.AttemptNumber, state.MaxRetryAttempts, selectedNode.Name,
+		state.NodeIndex+1, len(validNodes))
+
+	// Configure job to run on selected node
+	job.Spec.Template.Spec.NodeName = selectedNode.Name
+	job.Labels["tnf.etcd.openshift.io/attempt"] = fmt.Sprintf("%d", state.AttemptNumber)
+	job.Labels["tnf.etcd.openshift.io/node-index"] = fmt.Sprintf("%d", state.NodeIndex)
+
+	return nil
+}
+
+// getNodeNames extracts node names from a slice of nodes
+func getNodeNames(nodes []*corev1.Node) []string {
+	names := make([]string, len(nodes))
+	for i, node := range nodes {
+		names[i] = node.Name
+	}
+	return names
+}
+
+// resetJobRetryState clears the retry state for a job (called on success or when starting fresh)
+func resetJobRetryState(jobName string) {
+	delete(retryState, jobName)
+	klog.V(2).Infof("Reset retry state for job %s", jobName)
+}
 
 // RunTNFJobController starts a job controller for the specified job type.
 //
@@ -47,9 +157,14 @@ var (
 //   - nodeTarget: If non-nil, ties the job to this specific node (job name includes node suffix,
 //     job is labeled with node UID for cleanup, and pod is scheduled on this node).
 //     Use for node-specific jobs like auth and after-setup.
-//   - scheduleOnNode: Optional hint for where to schedule the job pod. Only used when nodeTarget is nil.
-//     Use for cluster-wide jobs that need to run on a specific node (e.g., update-setup on a pacemaker node).
-func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget *NodeTarget, scheduleOnNode *string, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string) {
+//   - validNodeFunc: Optional function that returns list of valid nodes to try (for multi-node retry logic).
+//     Job controller will try nodes serially until one succeeds, calling this function before each attempt.
+//     Only used when nodeTarget is nil. Use for cluster-wide jobs like update-setup.
+//   - retries: Number of retries before marking degraded. Meaning depends on job type:
+//   - Single-node (nodeTarget): sets backoffLimit (Kubernetes retries on same node)
+//   - Multi-node (validNodeFunc): sets maxRetryAttempts (loop across different nodes, backoffLimit=0)
+//   - Pass 0 for no retries
+func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget *NodeTarget, validNodeFunc ValidNodeFunc, retries int, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string) {
 	nodeNameForLogs := "any"
 	var jobNodeName *string
 	if nodeTarget != nil {
@@ -81,14 +196,23 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 		[]factory.Informer{},
 		[]JobHookFunc{
 			func(_ *operatorv1.OperatorSpec, job *batchv1.Job) error {
-				// Configure job based on node target
+				// Configure job based on node target and retry strategy
 				if nodeTarget != nil {
-					// Node-specific job: schedule on node and label with UID for cleanup
+					// Single-node job: schedule on node, label with UID, set backoffLimit for retries
 					job.Spec.Template.Spec.NodeName = nodeTarget.Name
 					job.Labels["node"] = nodeTarget.UID
-				} else if scheduleOnNode != nil {
-					// Cluster-wide job with scheduling hint
-					job.Spec.Template.Spec.NodeName = *scheduleOnNode
+					job.Spec.BackoffLimit = ptr.To(int32(retries))
+				} else if validNodeFunc != nil {
+					// Multi-node job: use validNodeFunc and retry state, backoffLimit=0 (no Kubernetes retries)
+					job.Spec.BackoffLimit = ptr.To(int32(0))
+					if err := configureMultiNodeJob(ctx, job, validNodeFunc, retries); err != nil {
+						return err
+					}
+				} else {
+					// No specific targeting - use default backoffLimit from yaml
+					if retries > 0 {
+						job.Spec.BackoffLimit = ptr.To(int32(retries))
+					}
 				}
 				job.SetName(jobType.GetJobName(jobNodeName))
 				job.Labels["app.kubernetes.io/name"] = jobType.GetNameLabelValue()
@@ -114,13 +238,19 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 //   - nodeTarget: If non-nil, ties the job to this specific node (job name includes node suffix,
 //     job is labeled with node UID for cleanup, and pod is scheduled on this node).
 //     Use for node-specific jobs like auth and after-setup.
-//   - scheduleOnNode: Optional hint for where to schedule the job pod. Only used when nodeTarget is nil.
-//     Use for cluster-wide jobs that need to run on a specific node (e.g., update-setup on a pacemaker node).
+//   - validNodeFunc: Optional function that returns list of valid nodes to try (for multi-node retry logic).
+//     Job controller will try nodes serially until one succeeds, calling this function before each attempt.
+//     Only used when nodeTarget is nil. Use for cluster-wide jobs like update-setup.
+//   - retries: Number of retries before marking degraded. Meaning depends on job type:
+//   - Single-node (nodeTarget): sets backoffLimit (Kubernetes retries on same node)
+//   - Multi-node (validNodeFunc): sets maxRetryAttempts (loop across different nodes, backoffLimit=0)
+//   - Pass 0 for no retries
 func RestartJobOrRunController(
 	ctx context.Context,
 	jobType tools.JobType,
 	nodeTarget *NodeTarget,
-	scheduleOnNode *string,
+	validNodeFunc ValidNodeFunc,
+	retries int,
 	controllerContext *controllercmd.ControllerContext,
 	operatorClient v1helpers.StaticPodOperatorClient,
 	kubeClient kubernetes.Interface,
@@ -158,10 +288,11 @@ func RestartJobOrRunController(
 	}
 
 	// always try to run the controller, CEO might have been restarted
-	RunTNFJobController(ctx, jobType, nodeTarget, scheduleOnNode, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
+	RunTNFJobController(ctx, jobType, nodeTarget, validNodeFunc, retries, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
 
 	if !jobExists {
-		// we are done
+		// No existing job - reset retry state to start fresh
+		resetJobRetryState(jobName)
 		return nil
 	}
 
@@ -176,6 +307,9 @@ func RestartJobOrRunController(
 	if err := DeleteAndWait(ctx, kubeClient, jobName, operatorclient.TargetNamespace); err != nil {
 		return fmt.Errorf("failed to delete existing update-setup job %s: %w", jobName, err)
 	}
+
+	// Reset retry state when starting fresh after deleting old job
+	resetJobRetryState(jobName)
 
 	return nil
 }

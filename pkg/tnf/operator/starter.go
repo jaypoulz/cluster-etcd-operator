@@ -298,7 +298,8 @@ func handleFencingSecretChange(
 		return
 	}
 
-	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
+	// Fencing job: no specific targeting, retries=3 sets backoffLimit
+	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
 	if err != nil {
 		klog.Errorf("failed to restart fencing job: %v", err)
 		return

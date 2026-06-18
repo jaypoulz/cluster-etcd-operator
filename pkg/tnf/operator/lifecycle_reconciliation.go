@@ -534,35 +534,64 @@ func updateSetup(
 			return fmt.Errorf("failed to create ConfigMap %s: %w", cmName, err)
 		}
 		klog.Infof("Created new ConfigMap %s for generation %d", cmName, generation)
+
+		// Clean up old ConfigMaps (keep 5 most recent)
+		if err := cleanupOldUpdateSetupConfigMaps(ctx, kubeClient, generation); err != nil {
+			klog.Warningf("Failed to cleanup old update-setup ConfigMaps: %v", err)
+		}
 	}
 
-	// Clean up ConfigMap after all jobs complete
-	defer func() {
-		if err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Delete(ctx, cmName, v1.DeleteOptions{}); err != nil {
-			klog.Warningf("failed to delete ConfigMap %s: %v", cmName, err)
+	// Create function that calculates valid target nodes
+	// Job controller will call this before each attempt (to get fresh node state)
+	validNodeFunc := func() ([]*corev1.Node, error) {
+		// Re-fetch K8s nodes
+		k8sNodes, err := ceohelpers.ListNodesFromInformer(c.nodeInformer)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list control plane nodes: %w", err)
 		}
-	}()
 
-	// Select first valid target node for update-setup job
-	// If it fails, next reconciliation will try a different node (via selectDiscoveryTargetNodes)
+		// Get pacemaker nodes from CR
+		pacemakerNodes, pacemakerCR, err := c.getPacemakerNodesWithCR()
+		pacemakerNodesAvailable := (err == nil)
+		if !pacemakerNodesAvailable {
+			klog.V(4).Infof("PacemakerCluster CR not available: %v - using all ready nodes", err)
+		} else {
+			if isPacemakerCRStale(pacemakerCR) {
+				klog.Warningf("PacemakerCluster CR status is stale (last updated %v) - using all ready nodes", pacemakerCR.Status.LastUpdated)
+				pacemakerNodesAvailable = false
+			}
+		}
+
+		if pacemakerNodesAvailable {
+			// Use intersection: nodes in both K8s and pacemaker
+			intersection := c.getIntersection(k8sNodes, pacemakerNodes)
+			klog.V(2).Infof("Valid targets (intersection): %v", getNodeNames(intersection))
+			return intersection, nil
+		}
+
+		// No actionable CR - use all ready K8s nodes for discovery
+		readyNodes := []*corev1.Node{}
+		for _, node := range k8sNodes {
+			if tools.IsNodeReady(node) {
+				readyNodes = append(readyNodes, node)
+			}
+		}
+		klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
+		return readyNodes, nil
+	}
+
+	// Run update-setup job - job controller will handle retries across valid nodes
 	// Note: Auth and after-setup jobs are managed by separate background controllers (lifecycle_job_controllers.go)
-	targetNode := validTargetNodes[0]
-	klog.Infof("Running update-setup on node %s (valid targets: %v)", targetNode.Name, getNodeNames(validTargetNodes))
+	klog.Infof("Starting update-setup job controller with %d initial valid target(s): %v", len(validTargetNodes), getNodeNames(validTargetNodes))
 
-	// Run update-setup job on target node - this is a cluster-wide operation that modifies pacemaker membership
+	const retries = 3 // Multi-node: try all valid nodes 3 times before degrading (backoffLimit=0)
 	timeout := getJobTimeout(tools.JobTypeUpdateSetup)
-	if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, &targetNode.Name,
+	if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, validNodeFunc, retries,
 		controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces,
 		jobs.DefaultConditions, timeout); err != nil {
-		return fmt.Errorf("failed to start update-setup job on %s: %w", targetNode.Name, err)
+		return fmt.Errorf("failed to start update-setup job controller: %w", err)
 	}
 
-	if err := jobs.WaitForCompletion(ctx, kubeClient, tools.JobTypeUpdateSetup.GetJobName(nil),
-		operatorclient.TargetNamespace, timeout); err != nil {
-		return fmt.Errorf("update-setup job failed on %s: %w", targetNode.Name, err)
-	}
-
-	klog.Infof("Update-setup succeeded on node %s", targetNode.Name)
 	return nil
 }
 
@@ -620,4 +649,67 @@ func encodeStringList(list []string) string {
 		return "[]"
 	}
 	return string(data)
+}
+
+// cleanupOldUpdateSetupConfigMaps deletes old update-setup ConfigMaps, keeping the 5 most recent for debugging.
+// This prevents ConfigMap accumulation while preserving recent history for comparison and troubleshooting.
+func cleanupOldUpdateSetupConfigMaps(ctx context.Context, kubeClient kubernetes.Interface, currentGeneration int64) error {
+	cmList, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).List(ctx, v1.ListOptions{
+		LabelSelector: "app.kubernetes.io/component=" + tools.TnfUpdateSetupComponentValue,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list update-setup ConfigMaps: %w", err)
+	}
+
+	if len(cmList.Items) <= maxFinishedJobsPerType {
+		klog.V(4).Infof("Found %d update-setup ConfigMaps (limit: %d) - no cleanup needed", len(cmList.Items), maxFinishedJobsPerType)
+		return nil
+	}
+
+	// Parse generations and sort by generation number (descending)
+	type cmWithGen struct {
+		cm  corev1.ConfigMap
+		gen int64
+	}
+	var cms []cmWithGen
+	for _, cm := range cmList.Items {
+		genStr := cm.Data["generation"]
+		if genStr == "" {
+			klog.Warningf("ConfigMap %s has no generation field, skipping cleanup", cm.Name)
+			continue
+		}
+		gen, err := strconv.ParseInt(genStr, 10, 64)
+		if err != nil {
+			klog.Warningf("ConfigMap %s has invalid generation %q: %v, skipping cleanup", cm.Name, genStr, err)
+			continue
+		}
+		cms = append(cms, cmWithGen{cm: cm, gen: gen})
+	}
+
+	// Sort by generation (newest first)
+	sort.Slice(cms, func(i, j int) bool {
+		return cms[i].gen > cms[j].gen
+	})
+
+	// Delete ConfigMaps beyond the limit
+	deletedCount := 0
+	for i := maxFinishedJobsPerType; i < len(cms); i++ {
+		cm := cms[i].cm
+		klog.V(2).Infof("Deleting old update-setup ConfigMap %s (generation %d, keeping %d most recent)", cm.Name, cms[i].gen, maxFinishedJobsPerType)
+		if err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Delete(ctx, cm.Name, v1.DeleteOptions{}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				klog.Warningf("Failed to delete old ConfigMap %s: %v", cm.Name, err)
+			}
+		} else {
+			deletedCount++
+		}
+	}
+
+	if deletedCount > 0 {
+		klog.Infof("Cleaned up %d old update-setup ConfigMaps (keeping %d most recent)", deletedCount, maxFinishedJobsPerType)
+	} else {
+		klog.V(4).Infof("No old update-setup ConfigMaps to clean up")
+	}
+
+	return nil
 }
