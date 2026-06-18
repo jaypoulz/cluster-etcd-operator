@@ -529,7 +529,7 @@ func (c *PacemakerLifecycleManager) initUpdateSetupGeneration(ctx context.Contex
 // pacemakerNodes: current pacemaker membership (name -> IP) from PacemakerCluster CR
 func updateSetup(
 	validTargetNodes []*corev1.Node,
-	validNodeFunc jobs.ValidNodeFunc,
+	validNodeFunc jobs.TargetNodesFunc,
 	allK8sNodes []*corev1.Node,
 	pacemakerNodes map[string]string,
 	ctx context.Context,
@@ -616,15 +616,41 @@ func updateSetup(
 		}
 	}
 
-	// Start update-setup job controller - it will manage job lifecycle via sync loop
-	// If a job already exists on the wrong node, syncMultiNodeJobState will detect valid nodes changed and delete it
+	// Restart update-setup job with new information (deletes existing job immediately, starts controller)
+	// Controller will manage job lifecycle via sync loop and retry across valid nodes
 	// Note: Auth and after-setup jobs are managed by separate background controllers (lifecycle_job_controllers.go)
 	klog.Infof("Starting update-setup job controller with %d initial valid target(s): %v", len(validTargetNodes), getNodeNames(validTargetNodes))
 
+	// Create jobConfigFunc that captures config for drift detection
+	jobConfigFunc := func() (string, error) {
+		nodes, err := validNodeFunc()
+		if err != nil {
+			return "", err
+		}
+		nodeUIDs := make([]string, len(nodes))
+		for i, node := range nodes {
+			nodeUIDs[i] = string(node.UID)
+		}
+		sort.Strings(nodeUIDs) // Sort for stable comparison
+
+		config := map[string]interface{}{
+			"nodeUIDs":           nodeUIDs,
+			"configMapGeneration": generation,
+		}
+		configJSON, err := json.Marshal(config)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal job config: %w", err)
+		}
+		return string(configJSON), nil
+	}
+
 	const retries = 3 // Multi-node: try all valid nodes 3 times before degrading (backoffLimit=0)
-	jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, validNodeFunc, retries,
+	timeout := getJobTimeout(tools.JobTypeUpdateSetup)
+	if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, validNodeFunc, jobConfigFunc, retries,
 		controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces,
-		jobs.DefaultConditions)
+		jobs.DefaultConditions, timeout); err != nil {
+		return fmt.Errorf("failed to restart update-setup job controller: %w", err)
+	}
 
 	return nil
 }

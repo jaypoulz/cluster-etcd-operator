@@ -59,7 +59,7 @@ func TestRunTNFJobController(t *testing.T) {
 		name                  string
 		jobType               tools.JobType
 		nodeTarget            *NodeTarget
-		validNodeFunc         ValidNodeFunc
+		targetNodesFunc       TargetNodesFunc
 		retries               int
 		existingControllers   map[string]bool
 		expectControllerRun   bool
@@ -69,7 +69,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Start controller for cluster-wide job",
 			jobType:               tools.JobTypeSetup,
 			nodeTarget:            nil,
-			validNodeFunc:         nil,
+			targetNodesFunc:         nil,
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
@@ -79,7 +79,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Start controller for node-specific job",
 			jobType:               tools.JobTypeAuth,
 			nodeTarget:            &NodeTarget{Name: "master-0", UID: "uid-master-0"},
-			validNodeFunc:         nil,
+			targetNodesFunc:         nil,
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
@@ -89,7 +89,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:          "Skip starting controller when already running",
 			jobType:       tools.JobTypeSetup,
 			nodeTarget:    nil,
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			existingControllers: map[string]bool{
 				"tnf-setup-job": true,
@@ -101,7 +101,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:          "Start different controller when another is running",
 			jobType:       tools.JobTypeFencing,
 			nodeTarget:    nil,
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			existingControllers: map[string]bool{
 				"tnf-setup-job": true,
@@ -113,7 +113,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:          "Start controller for different node when same job type exists",
 			jobType:       tools.JobTypeAuth,
 			nodeTarget:    &NodeTarget{Name: "master-1", UID: "uid-master-1"},
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			existingControllers: map[string]bool{
 				tools.JobTypeAuth.GetJobName(stringPtr("master-0")): true,
@@ -125,7 +125,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Cluster-wide job with validNodeFunc",
 			jobType:               tools.JobTypeUpdateSetup,
 			nodeTarget:            nil,
-			validNodeFunc:         func() ([]*corev1.Node, error) { return []*corev1.Node{}, nil },
+			targetNodesFunc:         func() ([]*corev1.Node, error) { return []*corev1.Node{}, nil },
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
@@ -173,7 +173,8 @@ func TestRunTNFJobController(t *testing.T) {
 				ctx,
 				tt.jobType,
 				tt.nodeTarget,
-				tt.validNodeFunc,
+				tt.targetNodesFunc,
+				nil, // jobConfigFunc
 				tt.retries,
 				controllerContext,
 				fakeOperatorClient,
@@ -207,7 +208,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 		name                    string
 		jobType                 tools.JobType
 		nodeTarget              *NodeTarget
-		validNodeFunc           ValidNodeFunc
+		targetNodesFunc         TargetNodesFunc
 		retries                 int
 		setupClient             func() *fake.Clientset
 		expectError             bool
@@ -220,7 +221,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 			name:          "Job does not exist - just runs controller",
 			jobType:       tools.JobTypeAuth,
 			nodeTarget:    &NodeTarget{Name: "master-0", UID: "uid-master-0"},
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			setupClient: func() *fake.Clientset {
 				// No job exists
@@ -235,7 +236,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 			name:          "Job exists and stops successfully - deletes and runs controller",
 			jobType:       tools.JobTypeSetup,
 			nodeTarget:    nil,
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			setupClient: func() *fake.Clientset {
 				job := &batchv1.Job{
@@ -279,7 +280,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 			name:          "Job exists but Get returns error - returns error",
 			jobType:       tools.JobTypeAuth,
 			nodeTarget:    &NodeTarget{Name: "master-0", UID: "uid-master-0"},
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			setupClient: func() *fake.Clientset {
 				client := fake.NewSimpleClientset()
@@ -298,7 +299,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 			name:          "Job exists but WaitForStopped times out - returns error",
 			jobType:       tools.JobTypeFencing,
 			nodeTarget:    nil,
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			setupClient: func() *fake.Clientset {
 				job := &batchv1.Job{
@@ -323,7 +324,7 @@ func TestRestartJobOrRunController(t *testing.T) {
 			name:          "Job exists, stops, but delete fails - returns error",
 			jobType:       tools.JobTypeAfterSetup,
 			nodeTarget:    &NodeTarget{Name: "master-1", UID: "uid-master-1"},
-			validNodeFunc: nil,
+			targetNodesFunc: nil,
 			retries:       3,
 			setupClient: func() *fake.Clientset {
 				jobName := tools.JobTypeAfterSetup.GetJobName(stringPtr("master-1"))
@@ -401,14 +402,15 @@ func TestRestartJobOrRunController(t *testing.T) {
 				ctx,
 				tt.jobType,
 				tt.nodeTarget,
-				tt.validNodeFunc,
+				tt.targetNodesFunc,
+				nil, // jobConfigFunc
 				tt.retries,
 				controllerContext,
 				fakeOperatorClient,
 				client,
 				kubeInformersForNamespaces,
 				DefaultConditions,
-				1*time.Second, // Short timeout for tests
+				1*time.Second, // timeout
 			)
 
 			// Verify
@@ -536,14 +538,15 @@ func TestRestartJobOrRunController_ParallelExecution(t *testing.T) {
 				context.Background(),
 				tools.JobTypeSetup,
 				nil, // nodeTarget
-				nil, // validNodeFunc
+				nil, // targetNodesFunc
+				nil, // jobConfigFunc
 				3,   // retries
 				controllerContext,
 				fakeOperatorClient,
 				client,
 				kubeInformersForNamespaces,
 				DefaultConditions,
-				2*time.Second,
+				2*time.Second, // timeout
 			)
 		}(i)
 	}

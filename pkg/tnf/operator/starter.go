@@ -305,7 +305,8 @@ func handleFencingSecretChange(
 	}
 
 	// Fencing job: no specific targeting, retries=3 sets backoffLimit
-	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
+	// TODO: Implement jobConfigFunc for fencing to capture node UIDs + secret UIDs
+	err = jobs.RestartJobOrRunController(ctx, tools.JobTypeFencing, nil, nil, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, tools.FencingJobCompletedTimeout)
 	if err != nil {
 		klog.Errorf("failed to restart fencing job: %v", err)
 		return
