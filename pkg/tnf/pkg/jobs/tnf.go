@@ -48,28 +48,62 @@ var (
 
 	// retryState tracks multi-node retry state for jobs using ValidNodeFunc
 	// Map key is job name, value tracks current attempt and node index
-	// No mutex needed: each job has only one controller (enforced by runningControllers)
 	retryState = make(map[string]*JobRetryState)
+	// retryStateMutex protects access to retryState map
+	retryStateMutex sync.Mutex
 )
 
 // JobRetryState tracks retry progress for multi-node jobs
 type JobRetryState struct {
-	AttemptNumber    int       // Current attempt (1-N)
-	NodeIndex        int       // Index of node to try in current attempt
-	ValidNodes       []string  // Cached node names from last validNodeFunc call
-	MaxRetryAttempts int       // Maximum attempts before degrading
-	LastFailTime     time.Time // When last failure occurred
+	mu               sync.Mutex // Protects fields below
+	AttemptNumber    int        // Current attempt (1-N)
+	NodeIndex        int        // Index of node to try in current attempt
+	ValidNodes       []string   // Cached node names from last validNodeFunc call
+	MaxRetryAttempts int        // Maximum attempts before degrading
+	LastFailTime     time.Time  // When last failure occurred
 }
 
-// configureMultiNodeJob handles multi-node retry logic for cluster-wide jobs.
-// Uses validNodeFunc to get current valid nodes, tracks retry state, and selects
-// which node to schedule the job on based on previous failures.
-// This function is called by the job hook on every sync, so it must be idempotent.
-func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc ValidNodeFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
-	jobName := job.Name
+// syncMultiNodeJobState manages the retry state for a multi-node job.
+// This should be called before the job hook to ensure state is current.
+// It handles:
+// - Checking if valid nodes changed (resets state)
+// - Detecting failed jobs and incrementing to next node
+// - Deleting failed jobs so they can be recreated on next node
+func syncMultiNodeJobState(ctx context.Context, jobName string, validNodeFunc ValidNodeFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
+	// Lock the global state map
+	retryStateMutex.Lock()
+	state, exists := retryState[jobName]
+	if !exists {
+		// Initialize state for new job
+		validNodes, err := validNodeFunc()
+		if err != nil {
+			retryStateMutex.Unlock()
+			return fmt.Errorf("failed to get valid nodes: %w", err)
+		}
+		if len(validNodes) == 0 {
+			retryStateMutex.Unlock()
+			return fmt.Errorf("no valid nodes available for job")
+		}
 
-	// Get current valid nodes from function
-	// Note: validNodeFunc should return nodes in deterministic order (sorted)
+		state = &JobRetryState{
+			AttemptNumber:    1,
+			NodeIndex:        0,
+			ValidNodes:       getNodeNames(validNodes),
+			MaxRetryAttempts: maxRetryAttempts,
+		}
+		retryState[jobName] = state
+		retryStateMutex.Unlock()
+		klog.Infof("Starting job %s - attempt %d/%d, will try nodes: %v",
+			jobName, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
+		return nil
+	}
+	retryStateMutex.Unlock()
+
+	// Lock this job's state for the rest of the sync
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Check if valid nodes have changed
 	validNodes, err := validNodeFunc()
 	if err != nil {
 		return fmt.Errorf("failed to get valid nodes: %w", err)
@@ -78,85 +112,136 @@ func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc 
 		return fmt.Errorf("no valid nodes available for job")
 	}
 
-	// Get or create retry state for this job
+	currentValidNodes := getNodeNames(validNodes)
+	if !slicesEqual(state.ValidNodes, currentValidNodes) {
+		// Valid nodes changed - reset state to start over
+		klog.Infof("Job %s valid nodes changed from %v to %v - resetting retry state",
+			jobName, state.ValidNodes, currentValidNodes)
+		state.AttemptNumber = 1
+		state.NodeIndex = 0
+		state.ValidNodes = currentValidNodes
+		return nil
+	}
+
+	// Get existing job (if any)
+	existingJob, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// No job exists - nothing to sync (will be created by JobController)
+			return nil
+		}
+		return fmt.Errorf("failed to get job %s: %w", jobName, err)
+	}
+
+	// Job exists - check if it's done
+	if IsComplete(*existingJob) {
+		// Success - clear state
+		klog.Infof("Job %s completed successfully", jobName)
+		resetJobRetryState(jobName)
+		return nil
+	}
+
+	if IsFailed(*existingJob) || IsStopped(*existingJob) {
+		// Failed - move to next node
+		currentNodeIndex := state.NodeIndex
+		klog.Infof("Job %s failed on node index %d - moving to next node", jobName, currentNodeIndex)
+
+		// Increment to next node
+		state.NodeIndex++
+
+		// Check if we've exhausted all nodes in this attempt
+		if state.NodeIndex >= len(validNodes) {
+			if state.AttemptNumber >= state.MaxRetryAttempts {
+				// Exceeded max attempts - reset to attempt 1 and continue
+				klog.Warningf("Job %s exhausted all %d attempts (tried %d nodes each), resetting to attempt 1",
+					jobName, state.MaxRetryAttempts, len(validNodes))
+				state.AttemptNumber = 1
+				state.NodeIndex = 0
+			} else {
+				// Start new attempt
+				state.AttemptNumber++
+				state.NodeIndex = 0
+				klog.Infof("Job %s exhausted all nodes in attempt %d, starting attempt %d/%d",
+					jobName, state.AttemptNumber-1, state.AttemptNumber, state.MaxRetryAttempts)
+			}
+		}
+
+		// Delete the failed job so it can be recreated on next node
+		klog.Infof("Deleting failed job %s to retry on node index %d", jobName, state.NodeIndex)
+		if err := DeleteAndWait(ctx, kubeClient, jobName, operatorclient.TargetNamespace); err != nil {
+			return fmt.Errorf("failed to delete failed job: %w", err)
+		}
+	}
+
+	// Job is running - nothing to do
+	return nil
+}
+
+// configureMultiNodeJob configures a job based on current retry state.
+// This is a pure function that just reads state and configures the job.
+// State management is done by syncMultiNodeJobState.
+func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc ValidNodeFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
+	jobName := job.Name
+
+	// Get current state (should have been initialized by syncMultiNodeJobState)
+	retryStateMutex.Lock()
 	state, exists := retryState[jobName]
+	retryStateMutex.Unlock()
+
 	if !exists {
-		// First attempt - initialize state
-		state = &JobRetryState{
-			AttemptNumber:    1,
-			NodeIndex:        0,
-			ValidNodes:       getNodeNames(validNodes),
-			MaxRetryAttempts: maxRetryAttempts,
+		// State should have been created by syncMultiNodeJobState, but handle gracefully
+		if err := syncMultiNodeJobState(ctx, jobName, validNodeFunc, maxRetryAttempts, kubeClient); err != nil {
+			return err
 		}
-		retryState[jobName] = state
-		klog.Infof("Starting job %s - attempt %d/%d, will try nodes: %v",
-			jobName, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
-	} else {
-		// Existing state - check if we need to increment
-		// The hook is called on every sync to build desired spec, not just after failures.
-		// Only increment if the existing job failed (was deleted by controller).
-		// Check if a job currently exists in the cluster with our current state.
-		existingJob, getErr := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
-		shouldIncrement := false
-		if getErr != nil {
-			if !apierrors.IsNotFound(getErr) {
-				// Unexpected error - log but don't fail
-				klog.Warningf("Failed to check existing job %s: %v - assuming no job exists", jobName, getErr)
-			}
-			// Job doesn't exist - previous job was deleted (failed or succeeded)
-			// Increment to try next node
-			shouldIncrement = true
-		} else {
-			// Job exists - check if it matches our current state
-			currentNodeIndexLabel := existingJob.Labels["tnf.etcd.openshift.io/node-index"]
-			expectedNodeIndexLabel := fmt.Sprintf("%d", state.NodeIndex)
-			if currentNodeIndexLabel != expectedNodeIndexLabel {
-				// Existing job has different node-index - shouldn't happen but log it
-				klog.Warningf("Job %s exists but has unexpected node-index label: %s (expected %s)",
-					jobName, currentNodeIndexLabel, expectedNodeIndexLabel)
-			}
-			// Job exists with current state - don't increment (this is an idempotent call)
-			shouldIncrement = false
-		}
-
-		if shouldIncrement {
-			state.NodeIndex++
-			klog.V(2).Infof("Job %s retry - moving to next node (index %d)", jobName, state.NodeIndex)
-		}
+		retryStateMutex.Lock()
+		state = retryState[jobName]
+		retryStateMutex.Unlock()
 	}
 
-	// Select node to try
-	if state.NodeIndex >= len(validNodes) {
-		// Exhausted all nodes in this attempt
-		if state.AttemptNumber >= state.MaxRetryAttempts {
-			// Exceeded max attempts - reset to attempt 1 and continue trying
-			// Controller will be marked degraded but keep retrying
-			klog.Warningf("Job %s exhausted all %d attempts (tried %d nodes each), resetting to attempt 1 and continuing",
-				jobName, state.MaxRetryAttempts, len(validNodes))
-			state.AttemptNumber = 1
-			state.NodeIndex = 0
-			state.ValidNodes = getNodeNames(validNodes)
-		} else {
-			// Start new attempt
-			state.AttemptNumber++
-			state.NodeIndex = 0
-			state.ValidNodes = getNodeNames(validNodes)
-			klog.Infof("Job %s exhausted all nodes in attempt %d, starting attempt %d/%d with nodes: %v",
-				jobName, state.AttemptNumber-1, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
-		}
+	// Get current valid nodes
+	validNodes, err := validNodeFunc()
+	if err != nil {
+		return fmt.Errorf("failed to get valid nodes: %w", err)
+	}
+	if len(validNodes) == 0 {
+		return fmt.Errorf("no valid nodes available for job")
 	}
 
-	selectedNode := validNodes[state.NodeIndex]
-	klog.Infof("Job %s attempt %d/%d: scheduling on node %s (index %d/%d)",
-		jobName, state.AttemptNumber, state.MaxRetryAttempts, selectedNode.Name,
-		state.NodeIndex+1, len(validNodes))
+	// Lock state for reading
+	state.mu.Lock()
+	nodeIndex := state.NodeIndex
+	attemptNumber := state.AttemptNumber
+	state.mu.Unlock()
+
+	// Validate node index
+	if nodeIndex >= len(validNodes) {
+		return fmt.Errorf("invalid node index %d (only %d nodes available)", nodeIndex, len(validNodes))
+	}
+
+	selectedNode := validNodes[nodeIndex]
+	klog.V(2).Infof("Job %s attempt %d/%d: scheduling on node %s (index %d/%d)",
+		jobName, attemptNumber, maxRetryAttempts, selectedNode.Name,
+		nodeIndex+1, len(validNodes))
 
 	// Configure job to run on selected node
 	job.Spec.Template.Spec.NodeName = selectedNode.Name
-	job.Labels["tnf.etcd.openshift.io/attempt"] = fmt.Sprintf("%d", state.AttemptNumber)
-	job.Labels["tnf.etcd.openshift.io/node-index"] = fmt.Sprintf("%d", state.NodeIndex)
+	job.Labels["tnf.etcd.openshift.io/attempt"] = fmt.Sprintf("%d", attemptNumber)
+	job.Labels["tnf.etcd.openshift.io/node-index"] = fmt.Sprintf("%d", nodeIndex)
 
 	return nil
+}
+
+// slicesEqual checks if two string slices have the same elements in the same order
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // getNodeNames extracts node names from a slice of nodes
@@ -170,6 +255,8 @@ func getNodeNames(nodes []*corev1.Node) []string {
 
 // resetJobRetryState clears the retry state for a job (called on success or when starting fresh)
 func resetJobRetryState(jobName string) {
+	retryStateMutex.Lock()
+	defer retryStateMutex.Unlock()
 	delete(retryState, jobName)
 	klog.V(2).Infof("Reset retry state for job %s", jobName)
 }
@@ -226,7 +313,12 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 					job.Labels["node"] = nodeTarget.UID
 					job.Spec.BackoffLimit = ptr.To(int32(retries))
 				} else if validNodeFunc != nil {
-					// Multi-node job: use validNodeFunc and retry state, backoffLimit=0 (no Kubernetes retries)
+					// Multi-node job: sync state first (handles transitions), then configure
+					// syncMultiNodeJobState manages state transitions based on job status
+					if err := syncMultiNodeJobState(ctx, job.Name, validNodeFunc, retries, kubeClient); err != nil {
+						return err
+					}
+					// Now configure job based on current state (pure function)
 					job.Spec.BackoffLimit = ptr.To(int32(0))
 					if err := configureMultiNodeJob(ctx, job, validNodeFunc, retries, kubeClient); err != nil {
 						return err
