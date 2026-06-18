@@ -1177,15 +1177,30 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 			expectUpdateSetupCalled: false,
 		},
 		{
-			name:               "node not ready - skip",
-			transitionComplete: true,
+			name:               "node not ready during bootstrap - skip",
+			transitionComplete: false,
 			nodeInformerSynced: true,
 			k8sNodes: []*corev1.Node{
 				createReadyNodeWithIPLM("master-0", "192.168.1.10"),
 				createNotReadyNodeLM("master-1"),
 			},
 			expectError:             false,
-			expectUpdateSetupCalled: false,
+			expectUpdateSetupCalled: false, // Should skip during bootstrap until all nodes Ready
+		},
+		{
+			name:               "node not ready after transition - reconcile with ready nodes only",
+			transitionComplete: true,
+			nodeInformerSynced: true,
+			k8sNodes: []*corev1.Node{
+				createReadyNodeWithIPLM("master-0", "192.168.1.10"),
+				createNotReadyNodeWithIPLM("master-1", "192.168.1.11"),
+			},
+			pacemakerNodes: map[string]string{
+				"master-0": "192.168.1.10",
+				"master-1": "192.168.1.11",
+			},
+			expectError:             false,
+			expectUpdateSetupCalled: false, // No drift - both nodes match, so no reconciliation needed
 		},
 		{
 			name:               "no drift - no action",
@@ -1390,6 +1405,25 @@ func createNotReadyNodeLM(name string) *corev1.Node {
 			Name: name,
 		},
 		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionFalse,
+				},
+			},
+		},
+	}
+}
+
+func createNotReadyNodeWithIPLM(name, ip string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: ip},
+			},
 			Conditions: []corev1.NodeCondition{
 				{
 					Type:   corev1.NodeReady,

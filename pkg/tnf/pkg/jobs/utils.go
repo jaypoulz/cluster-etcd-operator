@@ -108,6 +108,13 @@ func IsStopped(job batchv1.Job) bool {
 		return true
 	}
 
+	// Check for FailureTarget condition (Kubernetes 1.31+)
+	// FailureTarget means job is targeting failure but pods may still be terminating
+	if IsConditionTrue(job.Status.Conditions, batchv1.JobConditionType("FailureTarget")) {
+		klog.V(2).Infof("Job %s considered stopped: FailureTarget condition is True", job.Name)
+		return true
+	}
+
 	// Also check if job has no active pods and has exceeded backoff limit
 	// This handles cases where pods are stuck (e.g., Terminating on dead node) and
 	// Kubernetes hasn't set the Failed condition yet
