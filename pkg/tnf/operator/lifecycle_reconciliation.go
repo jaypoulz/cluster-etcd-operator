@@ -29,6 +29,10 @@ const (
 	// pacemakerCRStalenessThreshold is how long before a PacemakerCluster CR status is considered stale.
 	// Status collector runs every minute, so 5 minutes means we've missed ~5 consecutive updates.
 	pacemakerCRStalenessThreshold = 5 * time.Minute
+
+	// maxFinishedJobsPerType is the maximum number of finished ConfigMaps to keep per job type.
+	// Older ConfigMaps are cleaned up to prevent unbounded growth.
+	maxFinishedJobsPerType = 10
 )
 
 var (
