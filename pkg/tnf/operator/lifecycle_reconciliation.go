@@ -215,11 +215,51 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 		klog.Infof("Discovery mode (no actionable CR): will try nodes %v", getNodeNames(validTargetNodes))
 	}
 
+	// Create function that calculates valid target nodes
+	// Job controller will call this before each attempt (to get fresh node state)
+	validNodeFunc := func() ([]*corev1.Node, error) {
+		// Re-fetch K8s nodes
+		k8sNodes, err := ceohelpers.ListNodesFromInformer(c.nodeInformer)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list control plane nodes: %w", err)
+		}
+
+		// Get pacemaker nodes from CR
+		pacemakerNodes, pacemakerCR, err := c.getPacemakerNodesWithCR()
+		pacemakerNodesAvailable := (err == nil)
+		if !pacemakerNodesAvailable {
+			klog.V(4).Infof("PacemakerCluster CR not available: %v - using all ready nodes", err)
+		} else {
+			if isPacemakerCRStale(pacemakerCR) {
+				klog.Warningf("PacemakerCluster CR status is stale (last updated %v) - using all ready nodes", pacemakerCR.Status.LastUpdated)
+				pacemakerNodesAvailable = false
+			}
+		}
+
+		if pacemakerNodesAvailable {
+			// Use intersection: nodes in both K8s and pacemaker
+			intersection := c.getIntersection(k8sNodes, pacemakerNodes)
+			klog.V(2).Infof("Valid targets (intersection): %v", getNodeNames(intersection))
+			return intersection, nil
+		}
+
+		// No actionable CR - use all ready K8s nodes for discovery
+		readyNodes := []*corev1.Node{}
+		for _, node := range k8sNodes {
+			if tools.IsNodeReady(node) {
+				readyNodes = append(readyNodes, node)
+			}
+		}
+		klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
+		return readyNodes, nil
+	}
+
 	// Call update-setup with valid target nodes (creates/updates ConfigMap and ensures controller is running)
 	// Use updateSetupFunc to allow mocking in tests
 	return updateSetupFunc(
 		validTargetNodes,
-		k8sNodes,
+		validNodeFunc,
+		allK8sNodes,
 		pacemakerNodes,
 		ctx,
 		c.controllerContext,
@@ -450,11 +490,13 @@ func (c *PacemakerLifecycleManager) initUpdateSetupGeneration(ctx context.Contex
 }
 
 // updateSetup writes a snapshot ConfigMap, runs auth on all nodes, tries update-setup on valid targets, then after-setup on all.
-// validTargetNodes: nodes that can run the update-setup job (sorted, will try each until one succeeds)
+// validTargetNodes: nodes that can run the update-setup job (initial list for logging)
+// validNodeFunc: function that calculates fresh list of valid nodes on each retry attempt
 // allK8sNodes: all K8s nodes for the ConfigMap snapshot
 // pacemakerNodes: current pacemaker membership (name -> IP) from PacemakerCluster CR
 func updateSetup(
 	validTargetNodes []*corev1.Node,
+	validNodeFunc jobs.ValidNodeFunc,
 	allK8sNodes []*corev1.Node,
 	pacemakerNodes map[string]string,
 	ctx context.Context,
@@ -539,45 +581,6 @@ func updateSetup(
 		if err := cleanupOldUpdateSetupConfigMaps(ctx, kubeClient, generation); err != nil {
 			klog.Warningf("Failed to cleanup old update-setup ConfigMaps: %v", err)
 		}
-	}
-
-	// Create function that calculates valid target nodes
-	// Job controller will call this before each attempt (to get fresh node state)
-	validNodeFunc := func() ([]*corev1.Node, error) {
-		// Re-fetch K8s nodes
-		k8sNodes, err := ceohelpers.ListNodesFromInformer(c.nodeInformer)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list control plane nodes: %w", err)
-		}
-
-		// Get pacemaker nodes from CR
-		pacemakerNodes, pacemakerCR, err := c.getPacemakerNodesWithCR()
-		pacemakerNodesAvailable := (err == nil)
-		if !pacemakerNodesAvailable {
-			klog.V(4).Infof("PacemakerCluster CR not available: %v - using all ready nodes", err)
-		} else {
-			if isPacemakerCRStale(pacemakerCR) {
-				klog.Warningf("PacemakerCluster CR status is stale (last updated %v) - using all ready nodes", pacemakerCR.Status.LastUpdated)
-				pacemakerNodesAvailable = false
-			}
-		}
-
-		if pacemakerNodesAvailable {
-			// Use intersection: nodes in both K8s and pacemaker
-			intersection := c.getIntersection(k8sNodes, pacemakerNodes)
-			klog.V(2).Infof("Valid targets (intersection): %v", getNodeNames(intersection))
-			return intersection, nil
-		}
-
-		// No actionable CR - use all ready K8s nodes for discovery
-		readyNodes := []*corev1.Node{}
-		for _, node := range k8sNodes {
-			if tools.IsNodeReady(node) {
-				readyNodes = append(readyNodes, node)
-			}
-		}
-		klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
-		return readyNodes, nil
 	}
 
 	// Run update-setup job - job controller will handle retries across valid nodes
