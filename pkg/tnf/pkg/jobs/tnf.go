@@ -186,9 +186,21 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, targetNodesFunc 
 
 	// Job exists - check if it's done
 	if IsComplete(*existingJob) {
-		// Success - clear state
+		// Success - clear state and degraded condition
 		klog.Infof("Job %s completed successfully", jobName)
 		resetJobRetryState(jobName)
+
+		// Clear degraded condition if it was set
+		_, _, err := v1helpers.UpdateStatus(ctx, operatorClient, v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
+			Type:    jobName + operatorv1.OperatorStatusTypeDegraded,
+			Status:  operatorv1.ConditionFalse,
+			Reason:  "AsExpected",
+			Message: fmt.Sprintf("Job %s completed successfully", jobName),
+		}))
+		if err != nil {
+			klog.Errorf("Failed to clear degraded condition for %s: %v", jobName, err)
+		}
+
 		return nil
 	}
 
@@ -244,7 +256,7 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, targetNodesFunc 
 // configureMultiNodeJob configures a job based on current retry state.
 // This is a pure function that just reads state and configures the job.
 // State management is done by syncMultiNodeJobState.
-func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, targetNodesFunc TargetNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
+func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, targetNodesFunc TargetNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, kubeClient kubernetes.Interface, operatorClient v1helpers.StaticPodOperatorClient) error {
 	jobName := job.Name
 
 	// Get current state (should have been initialized by syncMultiNodeJobState)
@@ -254,7 +266,7 @@ func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, targetNodesFun
 
 	if !exists {
 		// State should have been created by syncMultiNodeJobState, but handle gracefully
-		if err := syncMultiNodeJobState(ctx, jobName, targetNodesFunc, jobConfigFunc, maxRetryAttempts, kubeClient); err != nil {
+		if err := syncMultiNodeJobState(ctx, jobName, targetNodesFunc, jobConfigFunc, maxRetryAttempts, kubeClient, operatorClient); err != nil {
 			return err
 		}
 		retryStateMutex.Lock()
@@ -381,12 +393,12 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 				} else if targetNodesFunc != nil {
 					// Multi-node job: sync state first (handles transitions), then configure
 					// syncMultiNodeJobState manages state transitions based on job status
-					if err := syncMultiNodeJobState(ctx, job.Name, targetNodesFunc, jobConfigFunc, retries, kubeClient); err != nil {
+					if err := syncMultiNodeJobState(ctx, job.Name, targetNodesFunc, jobConfigFunc, retries, kubeClient, operatorClient); err != nil {
 						return err
 					}
 					// Now configure job based on current state (pure function)
 					job.Spec.BackoffLimit = ptr.To(int32(0))
-					if err := configureMultiNodeJob(ctx, job, targetNodesFunc, jobConfigFunc, retries, kubeClient); err != nil {
+					if err := configureMultiNodeJob(ctx, job, targetNodesFunc, jobConfigFunc, retries, kubeClient, operatorClient); err != nil {
 						return err
 					}
 				} else {

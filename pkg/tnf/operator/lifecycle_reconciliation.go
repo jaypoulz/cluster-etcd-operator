@@ -634,7 +634,7 @@ func updateSetup(
 		sort.Strings(nodeUIDs) // Sort for stable comparison
 
 		config := map[string]interface{}{
-			"nodeUIDs":           nodeUIDs,
+			"nodeUIDs":            nodeUIDs,
 			"configMapGeneration": generation,
 		}
 		configJSON, err := json.Marshal(config)

@@ -69,7 +69,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Start controller for cluster-wide job",
 			jobType:               tools.JobTypeSetup,
 			nodeTarget:            nil,
-			targetNodesFunc:         nil,
+			targetNodesFunc:       nil,
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
@@ -79,18 +79,18 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Start controller for node-specific job",
 			jobType:               tools.JobTypeAuth,
 			nodeTarget:            &NodeTarget{Name: "master-0", UID: "uid-master-0"},
-			targetNodesFunc:         nil,
+			targetNodesFunc:       nil,
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
 			expectedControllerKey: tools.JobTypeAuth.GetJobName(stringPtr("master-0")),
 		},
 		{
-			name:          "Skip starting controller when already running",
-			jobType:       tools.JobTypeSetup,
-			nodeTarget:    nil,
+			name:            "Skip starting controller when already running",
+			jobType:         tools.JobTypeSetup,
+			nodeTarget:      nil,
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			existingControllers: map[string]bool{
 				"tnf-setup-job": true,
 			},
@@ -98,11 +98,11 @@ func TestRunTNFJobController(t *testing.T) {
 			expectedControllerKey: "tnf-setup-job",
 		},
 		{
-			name:          "Start different controller when another is running",
-			jobType:       tools.JobTypeFencing,
-			nodeTarget:    nil,
+			name:            "Start different controller when another is running",
+			jobType:         tools.JobTypeFencing,
+			nodeTarget:      nil,
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			existingControllers: map[string]bool{
 				"tnf-setup-job": true,
 			},
@@ -110,11 +110,11 @@ func TestRunTNFJobController(t *testing.T) {
 			expectedControllerKey: "tnf-fencing-job",
 		},
 		{
-			name:          "Start controller for different node when same job type exists",
-			jobType:       tools.JobTypeAuth,
-			nodeTarget:    &NodeTarget{Name: "master-1", UID: "uid-master-1"},
+			name:            "Start controller for different node when same job type exists",
+			jobType:         tools.JobTypeAuth,
+			nodeTarget:      &NodeTarget{Name: "master-1", UID: "uid-master-1"},
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			existingControllers: map[string]bool{
 				tools.JobTypeAuth.GetJobName(stringPtr("master-0")): true,
 			},
@@ -125,7 +125,7 @@ func TestRunTNFJobController(t *testing.T) {
 			name:                  "Cluster-wide job with validNodeFunc",
 			jobType:               tools.JobTypeUpdateSetup,
 			nodeTarget:            nil,
-			targetNodesFunc:         func() ([]*corev1.Node, error) { return []*corev1.Node{}, nil },
+			targetNodesFunc:       func() ([]*corev1.Node, error) { return []*corev1.Node{}, nil },
 			retries:               3,
 			existingControllers:   make(map[string]bool),
 			expectControllerRun:   true,
@@ -218,11 +218,11 @@ func TestRestartJobOrRunController(t *testing.T) {
 		expectControllerStarted bool
 	}{
 		{
-			name:          "Job does not exist - just runs controller",
-			jobType:       tools.JobTypeAuth,
-			nodeTarget:    &NodeTarget{Name: "master-0", UID: "uid-master-0"},
+			name:            "Job does not exist - just runs controller",
+			jobType:         tools.JobTypeAuth,
+			nodeTarget:      &NodeTarget{Name: "master-0", UID: "uid-master-0"},
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			setupClient: func() *fake.Clientset {
 				// No job exists
 				return fake.NewSimpleClientset()
@@ -233,11 +233,11 @@ func TestRestartJobOrRunController(t *testing.T) {
 			expectControllerStarted: true,
 		},
 		{
-			name:          "Job exists and stops successfully - deletes and runs controller",
-			jobType:       tools.JobTypeSetup,
-			nodeTarget:    nil,
+			name:            "Job exists and stops successfully - deletes and runs controller",
+			jobType:         tools.JobTypeSetup,
+			nodeTarget:      nil,
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			setupClient: func() *fake.Clientset {
 				job := &batchv1.Job{
 					ObjectMeta: metav1.ObjectMeta{
@@ -277,11 +277,11 @@ func TestRestartJobOrRunController(t *testing.T) {
 			expectControllerStarted: true,
 		},
 		{
-			name:          "Job exists but Get returns error - returns error",
-			jobType:       tools.JobTypeAuth,
-			nodeTarget:    &NodeTarget{Name: "master-0", UID: "uid-master-0"},
+			name:            "Job exists but Get returns error - returns error",
+			jobType:         tools.JobTypeAuth,
+			nodeTarget:      &NodeTarget{Name: "master-0", UID: "uid-master-0"},
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			setupClient: func() *fake.Clientset {
 				client := fake.NewSimpleClientset()
 				client.PrependReactor("get", "jobs", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
@@ -296,11 +296,11 @@ func TestRestartJobOrRunController(t *testing.T) {
 			expectControllerStarted: false, // Early error, controller not started
 		},
 		{
-			name:          "Job exists but WaitForStopped times out - returns error",
-			jobType:       tools.JobTypeFencing,
-			nodeTarget:    nil,
+			name:            "Job exists but WaitForStopped times out - returns error",
+			jobType:         tools.JobTypeFencing,
+			nodeTarget:      nil,
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			setupClient: func() *fake.Clientset {
 				job := &batchv1.Job{
 					ObjectMeta: metav1.ObjectMeta{
@@ -321,11 +321,11 @@ func TestRestartJobOrRunController(t *testing.T) {
 			expectControllerStarted: true, // Controller started before WaitForStopped failed
 		},
 		{
-			name:          "Job exists, stops, but delete fails - returns error",
-			jobType:       tools.JobTypeAfterSetup,
-			nodeTarget:    &NodeTarget{Name: "master-1", UID: "uid-master-1"},
+			name:            "Job exists, stops, but delete fails - returns error",
+			jobType:         tools.JobTypeAfterSetup,
+			nodeTarget:      &NodeTarget{Name: "master-1", UID: "uid-master-1"},
 			targetNodesFunc: nil,
-			retries:       3,
+			retries:         3,
 			setupClient: func() *fake.Clientset {
 				jobName := tools.JobTypeAfterSetup.GetJobName(stringPtr("master-1"))
 				job := &batchv1.Job{
