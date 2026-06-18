@@ -114,12 +114,24 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, validNodeFunc Va
 
 	currentValidNodes := getNodeNames(validNodes)
 	if !slicesEqual(state.ValidNodes, currentValidNodes) {
-		// Valid nodes changed - reset state to start over
-		klog.Infof("Job %s valid nodes changed from %v to %v - resetting retry state",
+		// Valid nodes changed - reset state and delete existing job to start over
+		klog.Infof("Job %s valid nodes changed from %v to %v - resetting retry state and deleting job",
 			jobName, state.ValidNodes, currentValidNodes)
 		state.AttemptNumber = 1
 		state.NodeIndex = 0
 		state.ValidNodes = currentValidNodes
+
+		// Delete existing job if it exists (might be running on a node that's no longer valid)
+		existingJob, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+		if err == nil {
+			// Job exists - delete it so we can recreate on correct node
+			if err := DeleteAndWait(ctx, kubeClient, jobName, operatorclient.TargetNamespace); err != nil {
+				return fmt.Errorf("failed to delete job %s after valid nodes changed: %w", jobName, err)
+			}
+			klog.Infof("Deleted job %s after valid nodes changed", jobName)
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check for existing job %s: %w", jobName, err)
+		}
 		return nil
 	}
 

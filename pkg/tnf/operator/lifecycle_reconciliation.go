@@ -616,17 +616,15 @@ func updateSetup(
 		}
 	}
 
-	// Run update-setup job - job controller will handle retries across valid nodes
+	// Start update-setup job controller - it will manage job lifecycle via sync loop
+	// If a job already exists on the wrong node, syncMultiNodeJobState will detect valid nodes changed and delete it
 	// Note: Auth and after-setup jobs are managed by separate background controllers (lifecycle_job_controllers.go)
 	klog.Infof("Starting update-setup job controller with %d initial valid target(s): %v", len(validTargetNodes), getNodeNames(validTargetNodes))
 
 	const retries = 3 // Multi-node: try all valid nodes 3 times before degrading (backoffLimit=0)
-	timeout := getJobTimeout(tools.JobTypeUpdateSetup)
-	if err := jobs.RestartJobOrRunController(ctx, tools.JobTypeUpdateSetup, nil, validNodeFunc, retries,
+	jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, validNodeFunc, retries,
 		controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces,
-		jobs.DefaultConditions, timeout); err != nil {
-		return fmt.Errorf("failed to start update-setup job controller: %w", err)
-	}
+		jobs.DefaultConditions)
 
 	return nil
 }

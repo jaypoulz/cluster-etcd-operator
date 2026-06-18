@@ -15,8 +15,9 @@ import (
 )
 
 const (
-// Cleanup runs every 30 seconds to delete orphaned pods and jobs
-// No constants needed - we delete all orphaned resources
+	// maxPodDeletionsPerSync limits orphaned pod deletions per sync to avoid API rate limiting.
+	// At 30s sync interval, 50 pods/sync = ~100 pods/minute cleanup rate.
+	maxPodDeletionsPerSync = 50
 )
 
 // CleanupOrphanedJobs cleans up TNF jobs for nodes that no longer exist in K8s.
@@ -135,6 +136,12 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedPods(ctx context.Context) err
 	deletedCount := 0
 	var errs []error
 	for _, pod := range podList.Items {
+		// Stop deleting if we've hit the per-sync limit to avoid API rate limiting
+		if deletedCount >= maxPodDeletionsPerSync {
+			klog.Infof("Reached max pod deletion limit (%d) for this sync - remaining orphaned pods will be cleaned in next sync", maxPodDeletionsPerSync)
+			break
+		}
+
 		shouldDelete := false
 		var reason string
 
@@ -159,11 +166,20 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedPods(ctx context.Context) err
 		if shouldDelete {
 			klog.V(2).Infof("Deleting orphaned TNF pod %s (%s)", pod.Name, reason)
 
+			// Try normal deletion first
 			err := c.kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 			if err != nil && !apierrors.IsNotFound(err) {
-				klog.Errorf("Failed to delete orphaned pod %s: %v", pod.Name, err)
-				errs = append(errs, fmt.Errorf("failed to delete pod %s: %w", pod.Name, err))
-				continue
+				// Normal deletion failed - try force deletion with zero grace period
+				klog.Warningf("Normal delete failed for pod %s, attempting force delete: %v", pod.Name, err)
+				gracePeriod := int64(0)
+				forceDeleteErr := c.kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+					GracePeriodSeconds: &gracePeriod,
+				})
+				if forceDeleteErr != nil && !apierrors.IsNotFound(forceDeleteErr) {
+					klog.Errorf("Failed to force delete orphaned pod %s: %v", pod.Name, forceDeleteErr)
+					errs = append(errs, fmt.Errorf("failed to delete pod %s: %w", pod.Name, forceDeleteErr))
+					continue
+				}
 			}
 			deletedCount++
 		}
