@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	// Cleanup runs every 30 seconds to delete orphaned pods and jobs
-	// No constants needed - we delete all orphaned resources
+// Cleanup runs every 30 seconds to delete orphaned pods and jobs
+// No constants needed - we delete all orphaned resources
 )
 
 // CleanupOrphanedJobs cleans up TNF jobs for nodes that no longer exist in K8s.
