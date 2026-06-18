@@ -30,9 +30,9 @@ const (
 	// Status collector runs every minute, so 5 minutes means we've missed ~5 consecutive updates.
 	pacemakerCRStalenessThreshold = 5 * time.Minute
 
-	// maxFinishedJobsPerType is the maximum number of finished ConfigMaps to keep per job type.
+	// maxUpdateSetupConfigMaps is the maximum number of update-setup ConfigMaps to keep for debugging.
 	// Older ConfigMaps are cleaned up to prevent unbounded growth.
-	maxFinishedJobsPerType = 10
+	maxUpdateSetupConfigMaps = 5
 )
 
 var (
@@ -697,8 +697,8 @@ func cleanupOldUpdateSetupConfigMaps(ctx context.Context, kubeClient kubernetes.
 		return fmt.Errorf("failed to list update-setup ConfigMaps: %w", err)
 	}
 
-	if len(cmList.Items) <= maxFinishedJobsPerType {
-		klog.V(4).Infof("Found %d update-setup ConfigMaps (limit: %d) - no cleanup needed", len(cmList.Items), maxFinishedJobsPerType)
+	if len(cmList.Items) <= maxUpdateSetupConfigMaps {
+		klog.V(4).Infof("Found %d update-setup ConfigMaps (limit: %d) - no cleanup needed", len(cmList.Items), maxUpdateSetupConfigMaps)
 		return nil
 	}
 
@@ -729,9 +729,9 @@ func cleanupOldUpdateSetupConfigMaps(ctx context.Context, kubeClient kubernetes.
 
 	// Delete ConfigMaps beyond the limit
 	deletedCount := 0
-	for i := maxFinishedJobsPerType; i < len(cms); i++ {
+	for i := maxUpdateSetupConfigMaps; i < len(cms); i++ {
 		cm := cms[i].cm
-		klog.V(2).Infof("Deleting old update-setup ConfigMap %s (generation %d, keeping %d most recent)", cm.Name, cms[i].gen, maxFinishedJobsPerType)
+		klog.V(2).Infof("Deleting old update-setup ConfigMap %s (generation %d, keeping %d most recent)", cm.Name, cms[i].gen, maxUpdateSetupConfigMaps)
 		if err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Delete(ctx, cm.Name, v1.DeleteOptions{}); err != nil {
 			if !apierrors.IsNotFound(err) {
 				klog.Warningf("Failed to delete old ConfigMap %s: %v", cm.Name, err)
@@ -742,7 +742,7 @@ func cleanupOldUpdateSetupConfigMaps(ctx context.Context, kubeClient kubernetes.
 	}
 
 	if deletedCount > 0 {
-		klog.Infof("Cleaned up %d old update-setup ConfigMaps (keeping %d most recent)", deletedCount, maxFinishedJobsPerType)
+		klog.Infof("Cleaned up %d old update-setup ConfigMaps (keeping %d most recent)", deletedCount, maxUpdateSetupConfigMaps)
 	} else {
 		klog.V(4).Infof("No old update-setup ConfigMaps to clean up")
 	}

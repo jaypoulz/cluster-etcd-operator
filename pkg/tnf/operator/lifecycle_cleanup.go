@@ -109,15 +109,16 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedJobs(ctx context.Context, k8s
 // This handles cases where Job deletion with propagationPolicy:Background doesn't clean up pods,
 // or where pods get stuck after Job deletion.
 func (c *PacemakerLifecycleManager) cleanupOrphanedPods(ctx context.Context) error {
-	// List all TNF pods (both node-specific and cluster-wide)
+	// List all TNF pods by their pod template label (app=tnf-job)
+	// Note: Pods inherit labels from Job.spec.template.metadata.labels, not Job.metadata.labels
 	podList, err := c.kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app.kubernetes.io/component=two-node-fencing-setup",
+		LabelSelector: "app=tnf-job",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to list TNF pods for cleanup: %w", err)
 	}
 
-	// Build set of existing TNF jobs
+	// Build set of existing TNF jobs (use Job-level label)
 	jobList, err := c.kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app.kubernetes.io/component=two-node-fencing-setup",
 	})
