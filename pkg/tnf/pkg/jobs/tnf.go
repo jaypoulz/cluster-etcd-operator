@@ -75,7 +75,8 @@ type JobRetryState struct {
 // - Checking if job config changed (resets state)
 // - Detecting failed jobs and incrementing to next node
 // - Deleting failed jobs so they can be recreated on next node
-func syncMultiNodeJobState(ctx context.Context, jobName string, targetNodesFunc TargetNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
+// - Setting degraded condition when max retries exhausted
+func syncMultiNodeJobState(ctx context.Context, jobName string, targetNodesFunc TargetNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, kubeClient kubernetes.Interface, operatorClient v1helpers.StaticPodOperatorClient) error {
 	// Lock the global state map
 	retryStateMutex.Lock()
 	state, exists := retryState[jobName]
@@ -202,9 +203,22 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, targetNodesFunc 
 		// Check if we've exhausted all nodes in this attempt
 		if state.NodeIndex >= len(targetNodes) {
 			if state.AttemptNumber >= state.MaxRetryAttempts {
-				// Exceeded max attempts - reset to attempt 1 and continue
-				klog.Warningf("Job %s exhausted all %d attempts (tried %d nodes each), resetting to attempt 1",
+				// Exceeded max attempts - set degraded condition and reset to attempt 1
+				klog.Warningf("Job %s exhausted all %d attempts (tried %d nodes each), marking degraded",
 					jobName, state.MaxRetryAttempts, len(targetNodes))
+
+				// Set degraded condition to indicate job has failed after all retries
+				_, _, err := v1helpers.UpdateStatus(ctx, operatorClient, v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
+					Type:    jobName + operatorv1.OperatorStatusTypeDegraded,
+					Status:  operatorv1.ConditionTrue,
+					Reason:  "MaxRetriesExceeded",
+					Message: fmt.Sprintf("Job failed after %d attempts across all nodes", state.MaxRetryAttempts),
+				}))
+				if err != nil {
+					klog.Errorf("Failed to set degraded condition for %s: %v", jobName, err)
+				}
+
+				// Reset to attempt 1 and continue trying (degraded condition remains set until success)
 				state.AttemptNumber = 1
 				state.NodeIndex = 0
 			} else {
