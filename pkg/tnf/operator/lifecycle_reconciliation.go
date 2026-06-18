@@ -80,12 +80,20 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 		return nil
 	}
 
-	// Check all K8s nodes are Ready before attempting drift reconciliation
-	// This ensures we don't try to reconcile while nodes are in flux (e.g., single-node case after delete)
-	for _, node := range k8sNodes {
-		if !tools.IsNodeReady(node) {
-			klog.V(4).Infof("Node %s is not Ready - skipping drift reconciliation (will retry in next sync)", node.Name)
-			return nil
+	// Check transition status to determine readiness requirements
+	transitionComplete, err := ceohelpers.HasExternalEtcdCompletedTransition(ctx, c.operatorClient)
+	if err != nil {
+		return fmt.Errorf("failed to check external etcd transition status: %w", err)
+	}
+
+	// Before transition: require all nodes Ready (stable bootstrap environment)
+	// After transition: allow NotReady nodes (this is exactly when we need drift reconciliation for node replacement)
+	if !transitionComplete {
+		for _, node := range k8sNodes {
+			if !tools.IsNodeReady(node) {
+				klog.V(4).Infof("Node %s is not Ready - skipping drift reconciliation during bootstrap (will retry in next sync)", node.Name)
+				return nil
+			}
 		}
 	}
 
@@ -236,21 +244,26 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 			}
 		}
 
+		// Filter to only Ready nodes - we can't schedule jobs on NotReady nodes
+		readyNodes := []*corev1.Node{}
 		if pacemakerNodesAvailable {
 			// Use intersection: nodes in both K8s and pacemaker
 			intersection := c.getIntersection(k8sNodes, pacemakerNodes)
-			klog.V(2).Infof("Valid targets (intersection): %v", getNodeNames(intersection))
-			return intersection, nil
-		}
-
-		// No actionable CR - use all ready K8s nodes for discovery
-		readyNodes := []*corev1.Node{}
-		for _, node := range k8sNodes {
-			if tools.IsNodeReady(node) {
-				readyNodes = append(readyNodes, node)
+			for _, node := range intersection {
+				if tools.IsNodeReady(node) {
+					readyNodes = append(readyNodes, node)
+				}
 			}
+			klog.V(2).Infof("Valid targets (intersection, ready only): %v", getNodeNames(readyNodes))
+		} else {
+			// No actionable CR - use all ready K8s nodes for discovery
+			for _, node := range k8sNodes {
+				if tools.IsNodeReady(node) {
+					readyNodes = append(readyNodes, node)
+				}
+			}
+			klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
 		}
-		klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
 		return readyNodes, nil
 	}
 
