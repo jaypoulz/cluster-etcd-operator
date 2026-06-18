@@ -219,7 +219,7 @@ func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc 
 	}
 
 	selectedNode := validNodes[nodeIndex]
-	klog.V(2).Infof("Job %s attempt %d/%d: scheduling on node %s (index %d/%d)",
+	klog.V(4).Infof("Job %s attempt %d/%d: scheduling on node %s (index %d/%d)",
 		jobName, attemptNumber, maxRetryAttempts, selectedNode.Name,
 		nodeIndex+1, len(validNodes))
 
@@ -287,7 +287,7 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 	runningControllersMutex.Lock()
 	if runningControllers[controllerKey] {
 		runningControllersMutex.Unlock()
-		klog.Infof("Two Node Fencing job controller for command %q on node %q is already running, skipping duplicate start", jobType.GetSubCommand(), nodeNameForLogs)
+		klog.V(4).Infof("Two Node Fencing job controller for command %q on node %q is already running, skipping duplicate start", jobType.GetSubCommand(), nodeNameForLogs)
 		return
 	}
 	// Mark this controller as running

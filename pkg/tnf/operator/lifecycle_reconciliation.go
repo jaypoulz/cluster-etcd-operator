@@ -333,7 +333,7 @@ func (c *PacemakerLifecycleManager) getActivePacemakerNodes() ([]*corev1.Node, e
 		// CR exists and is fresh - use intersection logic (K8s ∩ pacemaker)
 		intersection := c.getIntersection(readyNodes, pacemakerNodes)
 		if len(intersection) > 0 {
-			klog.V(2).Infof("Valid targets (intersection, ready only): %v", getNodeNames(intersection))
+			klog.V(4).Infof("Valid targets (intersection, ready only): %v", getNodeNames(intersection))
 			return intersection, nil
 		}
 		// No intersection - fall through to using all ready nodes
@@ -347,7 +347,7 @@ func (c *PacemakerLifecycleManager) getActivePacemakerNodes() ([]*corev1.Node, e
 	}
 
 	// CR doesn't exist, is stale, or no intersection - use all ready nodes
-	klog.V(2).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
+	klog.V(4).Infof("Valid targets (all ready nodes): %v", getNodeNames(readyNodes))
 	return readyNodes, nil
 }
 

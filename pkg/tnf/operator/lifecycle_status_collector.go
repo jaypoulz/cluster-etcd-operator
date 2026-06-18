@@ -102,7 +102,7 @@ func runPacemakerStatusCollectorCronJob(
 				},
 			}
 
-			klog.V(2).Infof("Status collector configured with node affinity for nodes: %v", nodeNames)
+			klog.V(4).Infof("Status collector configured with node affinity for nodes: %v", nodeNames)
 			return nil
 		},
 	)
