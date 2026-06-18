@@ -231,8 +231,14 @@ func runPacemakerControllers(ctx context.Context, controllerContext *controllerc
 		// - Post-transition: MonitorHealth(), ReconcilePacemakerConfig(), CleanupOrphanedJobs()
 		go lifecycleController.Run(ctx, 1)
 
-		// Start the status collector CronJob.
-		runPacemakerStatusCollectorCronJob(ctx, controllerContext, operatorClient, kubeClient, lifecycleManager, nodeInformer)
+		// Create shared validNodeFunc for both update-setup job and status collector CronJob
+		// Returns intersection of K8s (ready) nodes and pacemaker nodes, or all ready nodes if CR unavailable
+		validNodeFunc := func() ([]*corev1.Node, error) {
+			return lifecycleManager.getActivePacemakerNodes()
+		}
+
+		// Start the status collector CronJob with the same valid node logic
+		runPacemakerStatusCollectorCronJob(ctx, controllerContext, operatorClient, kubeClient, validNodeFunc)
 
 		klog.Infof("started Pacemaker controllers (lifecycle manager, status collector)")
 	}()

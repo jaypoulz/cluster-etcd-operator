@@ -64,15 +64,12 @@ type JobRetryState struct {
 // configureMultiNodeJob handles multi-node retry logic for cluster-wide jobs.
 // Uses validNodeFunc to get current valid nodes, tracks retry state, and selects
 // which node to schedule the job on based on previous failures.
-func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc ValidNodeFunc, maxRetryAttempts int) error {
+// This function is called by the job hook on every sync, so it must be idempotent.
+func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc ValidNodeFunc, maxRetryAttempts int, kubeClient kubernetes.Interface) error {
 	jobName := job.Name
 
-	// Note: This function is called from the job hook during ApplyJob, which happens
-	// when the job doesn't exist OR when the spec needs updating. The generic JobController
-	// deletes failed jobs, triggering this hook on the next sync to create a fresh job.
-	// At that point, we need to decide which node to try next.
-
 	// Get current valid nodes from function
+	// Note: validNodeFunc should return nodes in deterministic order (sorted)
 	validNodes, err := validNodeFunc()
 	if err != nil {
 		return fmt.Errorf("failed to get valid nodes: %w", err)
@@ -95,11 +92,37 @@ func configureMultiNodeJob(ctx context.Context, job *batchv1.Job, validNodeFunc 
 		klog.Infof("Starting job %s - attempt %d/%d, will try nodes: %v",
 			jobName, state.AttemptNumber, state.MaxRetryAttempts, state.ValidNodes)
 	} else {
-		// Existing state - this means we're being called after a previous job
-		// The JobController deletes failed jobs, so if we're here, the previous job failed
-		// and was deleted. Increment to next node.
-		state.NodeIndex++
-		klog.V(2).Infof("Job %s retry - moving to next node (index %d)", jobName, state.NodeIndex)
+		// Existing state - check if we need to increment
+		// The hook is called on every sync to build desired spec, not just after failures.
+		// Only increment if the existing job failed (was deleted by controller).
+		// Check if a job currently exists in the cluster with our current state.
+		existingJob, getErr := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+		shouldIncrement := false
+		if getErr != nil {
+			if !apierrors.IsNotFound(getErr) {
+				// Unexpected error - log but don't fail
+				klog.Warningf("Failed to check existing job %s: %v - assuming no job exists", jobName, getErr)
+			}
+			// Job doesn't exist - previous job was deleted (failed or succeeded)
+			// Increment to try next node
+			shouldIncrement = true
+		} else {
+			// Job exists - check if it matches our current state
+			currentNodeIndexLabel := existingJob.Labels["tnf.etcd.openshift.io/node-index"]
+			expectedNodeIndexLabel := fmt.Sprintf("%d", state.NodeIndex)
+			if currentNodeIndexLabel != expectedNodeIndexLabel {
+				// Existing job has different node-index - shouldn't happen but log it
+				klog.Warningf("Job %s exists but has unexpected node-index label: %s (expected %s)",
+					jobName, currentNodeIndexLabel, expectedNodeIndexLabel)
+			}
+			// Job exists with current state - don't increment (this is an idempotent call)
+			shouldIncrement = false
+		}
+
+		if shouldIncrement {
+			state.NodeIndex++
+			klog.V(2).Infof("Job %s retry - moving to next node (index %d)", jobName, state.NodeIndex)
+		}
 	}
 
 	// Select node to try
@@ -205,7 +228,7 @@ func RunTNFJobController(ctx context.Context, jobType tools.JobType, nodeTarget 
 				} else if validNodeFunc != nil {
 					// Multi-node job: use validNodeFunc and retry state, backoffLimit=0 (no Kubernetes retries)
 					job.Spec.BackoffLimit = ptr.To(int32(0))
-					if err := configureMultiNodeJob(ctx, job, validNodeFunc, retries); err != nil {
+					if err := configureMultiNodeJob(ctx, job, validNodeFunc, retries, kubeClient); err != nil {
 						return err
 					}
 				} else {
