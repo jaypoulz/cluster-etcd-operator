@@ -259,7 +259,7 @@ func (c *PacemakerLifecycleManager) ReconcilePacemakerConfig(ctx context.Context
 	return updateSetupFunc(
 		validTargetNodes,
 		validNodeFunc,
-		allK8sNodes,
+		k8sNodes,
 		pacemakerNodes,
 		ctx,
 		c.controllerContext,

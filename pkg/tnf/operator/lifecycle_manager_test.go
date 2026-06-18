@@ -81,6 +81,7 @@ import (
 	pacmkrv1 "github.com/openshift/api/etcd/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
+	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pacemaker"
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/events"
@@ -1338,7 +1339,7 @@ func TestReconcilePacemakerConfig(t *testing.T) {
 			// Mock updateSetup
 			updateSetupCalled := false
 			originalUpdateSetup := updateSetupFunc
-			updateSetupFunc = func(validTargetNodes, allK8sNodes []*corev1.Node, pacemakerNodes map[string]string, ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) error {
+			updateSetupFunc = func(validTargetNodes []*corev1.Node, validNodeFunc jobs.ValidNodeFunc, allK8sNodes []*corev1.Node, pacemakerNodes map[string]string, ctx context.Context, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) error {
 				updateSetupCalled = true
 				return tt.mockUpdateSetupError
 			}
