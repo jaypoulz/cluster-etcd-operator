@@ -68,20 +68,26 @@ func (c *PacemakerLifecycleManager) cleanupOrphanedJobs(ctx context.Context, k8s
 	orphanedCount := 0
 	var errs []error
 	for _, job := range jobList.Items {
+		var shouldDelete bool
+		var deleteReason string
+
 		// Get node UID from job label (not node name - UIDs are stable across node replacements).
 		// If a node is deleted and re-added with the same name but different UID,
 		// jobs labeled with the old UID should be cleaned up.
 		jobNodeUID, ok := job.Labels["node"]
 		if !ok {
-			// Jobs without node label are not node-specific (e.g., setup/fencing jobs)
-			klog.V(4).Infof("Job %s has no node label, skipping", job.Name)
-			continue
+			// Old job without node UID label (created before label was added).
+			// Delete it - jobs are idempotent and will be recreated with proper labels.
+			shouldDelete = true
+			deleteReason = "old job without node UID label (migration cleanup)"
+		} else if !currentNodeUIDs[jobNodeUID] {
+			// Node doesn't exist or was replaced - delete orphaned job
+			shouldDelete = true
+			deleteReason = fmt.Sprintf("node UID %s no longer exists", jobNodeUID)
 		}
 
-		// Check if the node UID still exists in current node set
-		if !currentNodeUIDs[jobNodeUID] {
-			// Node doesn't exist - delete orphaned job
-			klog.Infof("Deleting orphaned TNF job %s for deleted/replaced node (UID: %s)", job.Name, jobNodeUID)
+		if shouldDelete {
+			klog.Infof("Deleting orphaned TNF job %s: %s", job.Name, deleteReason)
 
 			// Delete the orphaned job
 			deletePolicy := metav1.DeletePropagationBackground
