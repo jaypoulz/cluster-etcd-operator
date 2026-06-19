@@ -1057,18 +1057,19 @@ func TestCleanupOrphanedJobs(t *testing.T) {
 			},
 		},
 		{
-			name: "job without node label skipped",
+			name: "job without node label deleted - migration cleanup",
 			k8sNodes: []*corev1.Node{
 				createReadyNodeLM("master-0"),
 			},
 			existingJobs: []runtime.Object{
 				createTNFJobWithNodeLabelLM("tnf-auth-job-master-0", "master-0", "tnf-auth-job"),
-				createTNFJobWithoutNodeLabelLM("tnf-legacy-job", "tnf-auth-job"), // Old job without label
+				createTNFJobWithoutNodeLabelLM("tnf-legacy-job", "tnf-auth-job"), // Old job without label - will be deleted and recreated with label
 			},
-			expectJobsDeleted: []string{},
+			expectJobsDeleted: []string{
+				"tnf-legacy-job", // Deleted (no node label - migration cleanup)
+			},
 			expectJobsKept: []string{
 				"tnf-auth-job-master-0",
-				"tnf-legacy-job", // Not deleted (no node label)
 			},
 		},
 		{
