@@ -30,7 +30,7 @@ func runPacemakerStatusCollectorCronJob(
 	controllerContext *controllercmd.ControllerContext,
 	operatorClient v1helpers.StaticPodOperatorClient,
 	kubeClient kubernetes.Interface,
-	validNodeFunc jobs.ValidNodeFunc,
+	validNodeFunc jobs.TargetNodesFunc,
 ) {
 	// Start the cronjob controller to create a CronJob for periodic status collection.
 	statusCronJobController := jobs.NewCronJobController(

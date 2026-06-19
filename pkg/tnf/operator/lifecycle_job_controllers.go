@@ -2,9 +2,7 @@ package operator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -251,13 +249,13 @@ func startTnfJobcontrollers(
 	}
 
 	// Check if there's a stopped update-setup job from previous drift reconciliation
-	// If found, start a controller for it so it can update Progressing condition
+	// that needs condition updates (e.g., operator restarted before controller processed completion)
 	updateSetupJobName := tools.JobTypeUpdateSetup.GetJobName(nil)
 	updateSetupJob, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, updateSetupJobName, metav1.GetOptions{})
 	if err == nil {
-		// Job exists - check if it's stopped (completed or failed)
-		if jobs.IsStopped(*updateSetupJob) {
-			klog.Infof("Found stopped update-setup job %s - starting controller to update Progressing condition", updateSetupJobName)
+		// Job exists - check if it's stopped (completed or failed) and controller not already running
+		if jobs.IsStopped(*updateSetupJob) && !jobs.IsControllerRunning(updateSetupJobName) {
+			klog.V(2).Infof("Found stopped update-setup job %s without running controller, ensuring controller is started", updateSetupJobName)
 			// No targetNodesFunc/jobConfigFunc here - just starting controller to update conditions for existing stopped job
 			jobs.RunTNFJobController(ctx, tools.JobTypeUpdateSetup, nil, nil, nil, 0, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 		}
@@ -287,47 +285,6 @@ func waitForEtcdBootstrapCompleted(ctx context.Context, operatorClient v1helpers
 		}
 	}
 	return nil
-}
-
-// createFencingJobConfigFunc creates a JobConfigFunc for the fencing job.
-// Returns a function that captures node UIDs and fencing secret UIDs for drift detection.
-func createFencingJobConfigFunc(nodeList []*corev1.Node, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
-	return func() (string, error) {
-		// Collect node UIDs
-		nodeUIDs := make([]string, len(nodeList))
-		for i, node := range nodeList {
-			nodeUIDs[i] = string(node.UID)
-		}
-		sort.Strings(nodeUIDs)
-
-		// Collect fencing secret UIDs from informer
-		secretsLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().Secrets().Lister()
-		allSecrets, err := secretsLister.List(labels.Everything())
-		if err != nil {
-			return "", fmt.Errorf("failed to list secrets: %w", err)
-		}
-
-		var secretUIDs []string
-		for _, secret := range allSecrets {
-			if tools.IsFencingSecret(secret.Name) {
-				secretUIDs = append(secretUIDs, string(secret.UID))
-			}
-		}
-		sort.Strings(secretUIDs)
-
-		// Create config map with both node and secret UIDs
-		config := map[string]interface{}{
-			"nodeUIDs":   nodeUIDs,
-			"secretUIDs": secretUIDs,
-		}
-
-		configJSON, err := json.Marshal(config)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal fencing config: %w", err)
-		}
-
-		return string(configJSON), nil
-	}
 }
 
 // waitForTnfAfterSetupJobsCompletion waits for all after-setup jobs to complete.

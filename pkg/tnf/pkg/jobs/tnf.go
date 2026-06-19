@@ -337,6 +337,13 @@ func resetJobRetryState(jobName string) {
 	klog.V(2).Infof("Reset retry state for job %s", jobName)
 }
 
+// IsControllerRunning checks if a controller is already running for the given job name
+func IsControllerRunning(jobName string) bool {
+	runningControllersMutex.Lock()
+	defer runningControllersMutex.Unlock()
+	return runningControllers[jobName]
+}
+
 // RunTNFJobController starts a job controller for the specified job type.
 //
 // Parameters:

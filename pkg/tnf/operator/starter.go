@@ -19,6 +19,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -259,7 +260,7 @@ func createFencingJobConfigFunc(nodeList []*corev1.Node, kubeInformersForNamespa
 
 		// Collect fencing secret UIDs from informer
 		secretsLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().Secrets().Lister()
-		allSecrets, err := secretsLister.Secrets(operatorclient.TargetNamespace).List(metav1.ListOptions{}.LabelSelector)
+		allSecrets, err := secretsLister.List(labels.Everything())
 		if err != nil {
 			return "", fmt.Errorf("failed to list secrets: %w", err)
 		}
