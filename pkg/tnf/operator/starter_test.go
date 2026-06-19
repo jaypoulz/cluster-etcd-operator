@@ -326,7 +326,8 @@ func TestHandleFencingSecretChange_skipsBeforeExternalEtcdTransition(t *testing.
 		Data: map[string][]byte{"token": []byte("x")},
 	}
 
-	handleFencingSecretChange(ctx, nil, secret, controllerContext, fakeOperatorClient, fakeKube, kubeInformersForNamespaces)
+	// Pass nil nodeInformer - function returns early before using it when transition not complete
+	handleFencingSecretChange(ctx, nil, secret, controllerContext, fakeOperatorClient, fakeKube, kubeInformersForNamespaces, nil)
 
 	jobList, err := fakeKube.BatchV1().Jobs(operatorclient.TargetNamespace).List(ctx, metav1.ListOptions{})
 	require.NoError(t, err)
