@@ -616,10 +616,42 @@ func updateSetup(
 		}
 	}
 
+	// When reusing ConfigMap (desired state unchanged), check if job already exists and is working.
+	// Skip restarting if job is still running OR completed successfully - pacemaker just needs time to converge.
+	// This prevents redundant job creation when:
+	// 1. First job completes and updates pacemaker
+	// 2. Status collector updates CR with partial pacemaker state
+	// 3. Reconciliation triggered again, detects drift (pacemaker not fully converged yet)
+	// 4. Desired state matches current generation → would restart job unnecessarily
+	if !shouldCreateNewConfigMap {
+		jobName := tools.JobTypeUpdateSetup.GetJobName(nil)
+		existingJob, err := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+		if err == nil {
+			// Job exists - check state
+			if !jobs.IsStopped(*existingJob) {
+				// Job still running - skip restart to avoid interrupting in-progress work
+				klog.Infof("Reusing generation %d - job still running, skipping restart (waiting for job completion)", generation)
+				return nil
+			} else if jobs.IsComplete(*existingJob) {
+				// Job completed successfully - skip restart, pacemaker convergence in progress
+				klog.Infof("Reusing generation %d - job already completed successfully, skipping restart (waiting for pacemaker convergence)", generation)
+				return nil
+			}
+			// Job stopped but not complete (failed) - fall through to restart
+			klog.Infof("Reusing generation %d - existing job failed, restarting", generation)
+		} else if !apierrors.IsNotFound(err) {
+			// Error checking job (not NotFound) - log warning and fall through to restart
+			klog.Warningf("Failed to check existing job for generation %d: %v - will restart", generation, err)
+		} else {
+			// Job doesn't exist - fall through to start
+			klog.Infof("Reusing generation %d - no existing job found, starting", generation)
+		}
+	}
+
 	// Restart update-setup job with new information (deletes existing job immediately, starts controller)
 	// Controller will manage job lifecycle via sync loop and retry across valid nodes
 	// Note: Auth and after-setup jobs are managed by separate background controllers (lifecycle_job_controllers.go)
-	klog.Infof("Starting update-setup job controller with %d initial valid target(s): %v", len(validTargetNodes), getNodeNames(validTargetNodes))
+	klog.Infof("Starting update-setup job controller for generation %d with %d initial valid target(s): %v", generation, len(validTargetNodes), getNodeNames(validTargetNodes))
 
 	// Create jobConfigFunc that captures config for drift detection
 	jobConfigFunc := func() (string, error) {
