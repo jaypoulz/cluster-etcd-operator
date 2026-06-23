@@ -722,6 +722,11 @@ func encodeNodeList(nodes []*corev1.Node) (string, error) {
 		})
 	}
 
+	// Sort by name to ensure stable ConfigMap comparison (avoid order-sensitive duplicates)
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].Name < infos[j].Name
+	})
+
 	data, err := json.Marshal(infos)
 	if err != nil {
 		return "", err
